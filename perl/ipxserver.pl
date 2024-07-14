@@ -28,21 +28,24 @@ use Socket;
 use IO::Socket::INET;
 use feature 'signatures';
 no warnings qw(experimental::signatures);
+use Readonly;
 
 #use Data::Dumper;
 
 my $VERSION = '20100124';
 
-my @DEBUG = (
+Readonly my @DEBUG => (
 	LOG_EMERG,	# system is unusable
 	LOG_ALERT,	# action must be taken immediately
 	LOG_CRIT,	# critical conditions
 	LOG_ERR,	# error conditions
 	LOG_WARNING,	# warning conditions
-	LOG_NOTICE,	# normal, but significant, condition
+	LOG_NOTICE,	# normal, but significant, condition, see $base_verbosity
 	LOG_INFO,	# informational message
 	LOG_DEBUG	# verbose-level message
 );
+
+Readonly my $base_verbosity => 5;
 
 =head1 OPTIONS
 
@@ -152,12 +155,12 @@ else {
 	syslog LOG_NOTICE, 'started';
 }
 
-if (5+$opts{v}-$opts{q}>=scalar(@DEBUG)) {
+if ($base_verbosity + $opts{v} - $opts{q} >= scalar(@DEBUG)) {
 	setlogmask(LOG_UPTO(LOG_DEBUG));
-} elsif (5+$opts{v}-$opts{q}<0) {
+} elsif ($base_verbosity + $opts{v} - $opts{q} < 0) {
 	setlogmask(LOG_UPTO(LOG_EMERG));
 } else {
-	setlogmask(LOG_UPTO($DEBUG[5+$opts{v}-$opts{q}]));
+	setlogmask(LOG_UPTO($DEBUG[$base_verbosity + $opts{v} - $opts{q}]));
 }
 
 my $sock = &openSocket();
@@ -292,7 +295,7 @@ while ($running) {
 	# ping
 	if ($d->{src}{sock} == 2 && $d->{dst}{sock} == 2) {
 		# registration hack
-		syslog LOG_INFO, "[$srcaddr] echo req from " . $d->{src}{node}
+		syslog LOG_INFO, "[$srcaddr] echo req from $d->{src}{node}"
 			unless ($d->{src}{node} eq '000000000000');
 
 		my $reply = pack 'nnCCH8H12nH8H12na*',
@@ -334,7 +337,7 @@ sub sigHUP {
 	%clients = ();
 }
 
-sub openSocket {
+sub openSocket () {
 	my %args = (
 		LocalPort	=> $opts{p},
 		Proto		=> 'udp'
@@ -358,10 +361,7 @@ sub openSocket {
 	return $sock;
 }
 
-sub ipxDecode {
-	my $srcaddr = shift;
-	my $packet = shift;
-
+sub ipxDecode ($srcaddr, $packet) {
 	unless (length($packet) >= 30) {
 		syslog LOG_WARNING, "[$srcaddr] packet too short";
 		return;
@@ -403,9 +403,7 @@ sub ipxDecode {
 	return \%d;
 }
 
-sub isReg {
-	my $d = shift;
-
+sub isReg ($d) {
 	# we ignore 'type' as it seems that:
 	#  * dosbox 0.72 => type = (not initialised - garbage)
 	#  * dosbox 0.73 => type = 0
@@ -418,12 +416,7 @@ sub isReg {
 			&& $d->{src}{sock} == 2);
 }
 
-sub register {
-	my $clients = shift;
-	my $ts = shift;
-	my $srcaddr = shift;
-	my $srcport = shift;
-
+sub register ($clients, $ts, $srcaddr, $srcport) {
 	# rfc1234 does not seem to be completely NAT safe so we
 	# include the src port too, also makes 'ipxnet ping' pretty
 	my $node = unpack('H12', inet_aton($srcaddr) . pack('n', $srcport));
