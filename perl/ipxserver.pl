@@ -206,9 +206,7 @@ while ($running) {
 		foreach my $client (keys %clients) {
 			next if ($clients{$client}{ts} > $ts - $opts{i});
 
-			syslog LOG_INFO, '[' . $clients{$client}{ip} . ']'
-						. ' idle timeout for '
-						. $clients{$client}{node};
+			syslog LOG_INFO, "[$clients{$client}{ip}] idle timeout for $clients{$client}{node}";
 			delete $clients{$client};
 		}
 
@@ -261,8 +259,7 @@ while ($running) {
 
 		$clients{"$srcaddr:$srcport"}{ts} = $ts;
 
-		syslog LOG_DEBUG, "[$srcaddr] pkt " . $d->{src}{node}
-					. ' > ' . $d->{dst}{node};
+		syslog LOG_DEBUG, "[$srcaddr] pkt $d->{src}{node} > $d->{dst}{node}";
 
 		my @dest = ($d->{dst}{node} eq 'ffffffffffff')
 			? grep { $clients{$_}{node} ne $d->{src}{node} }
@@ -277,13 +274,11 @@ while ($running) {
 			my $n = $sock->send($payload, MSG_DONTWAIT,
 						$clients{$dst}{paddr});
 			unless (defined($n)) {
-				syslog LOG_ERR, '[' . $clients{$dst}{ip} . ']'
-						. 'unable to sendto()';
+				syslog LOG_ERR, "[$clients{$dst}{ip}] unable to sendto()";
 				next;
 			}
 			unless ($n == length($payload)) {
-				syslog LOG_ERR, '[' . $clients{$dst}{ip} . ']'
-						. 'unable to sendto() complete payload';
+				syslog LOG_ERR, "[$clients{$dst}{ip}] unable to sendto() complete payload";
 				next;
 			}
 		}
