@@ -111,24 +111,24 @@ GetOptions(
 	'man'		=> sub { pod2usage(-exitval => 0, -verbose => 2) },
 	'V|version'	=> sub { pod2usage(-exitval => 0, -message => "ipxserver - version $VERSION\n") },
 
-	'v+'		=> \$opts{'v'},
-	'q+'		=> \$opts{'q'},
+	'v+'		=> \$opts{v},
+	'q+'		=> \$opts{q},
 
-	'l|log=i'	=> \$opts{'l'},
-	'p|port=i'	=> \$opts{'p'},
-	'u|user=s'	=> \$opts{'u'},
-	'i|idle=i'	=> \$opts{'i'},
+	'l|log=i'	=> \$opts{l},
+	'p|port=i'	=> \$opts{p},
+	'u|user=s'	=> \$opts{u},
+	'i|idle=i'	=> \$opts{i},
 
-	'n|no-fork'	=> \$opts{'n'},
+	'n|no-fork'	=> \$opts{n},
 ) || pod2usage(2);
 
 die 'invalid facility log value (0 <= n < 8)'
-	unless ($opts{'l'} >= 0 && $opts{'l'} < 8);
+	unless ($opts{l} >= 0 && $opts{l} < 8);
 die 'invalid port number to listen on (0 < n < 65536)'
-	unless ($opts{'p'} > 0 && $opts{'p'} < 65536);
+	unless ($opts{p} > 0 && $opts{p} < 65536);
 
-if (defined($opts{'n'})) {
-	openlog(basename($0), 'ndelay|pid|perror', "local$opts{'l'}");
+if (defined($opts{n})) {
+	openlog(basename($0), 'ndelay|pid|perror', "local$opts{l}");
 }
 else {  
 	# perlfaq8 - How do I fork a daemon process?
@@ -145,17 +145,17 @@ else {
 
 	exit 0 if ($pid != 0);
 
-	openlog(basename($0), 'ndelay|pid', "local$opts{'l'}");
+	openlog(basename($0), 'ndelay|pid', "local$opts{l}");
 
 	syslog LOG_NOTICE, 'started';
 }
 
-if (5+$opts{'v'}-$opts{'q'}>=scalar(@DEBUG)) {
+if (5+$opts{v}-$opts{q}>=scalar(@DEBUG)) {
 	setlogmask(LOG_UPTO(LOG_DEBUG));
-} elsif (5+$opts{'v'}-$opts{'q'}<0) {
+} elsif (5+$opts{v}-$opts{q}<0) {
 	setlogmask(LOG_UPTO(LOG_EMERG));
 } else {
-	setlogmask(LOG_UPTO($DEBUG[5+$opts{'v'}-$opts{'q'}]));
+	setlogmask(LOG_UPTO($DEBUG[5+$opts{v}-$opts{q}]));
 }
 
 my $sock = &openSocket();
@@ -168,26 +168,26 @@ $0 = basename($0);
 
 # no longer need root
 if ($< == 0 || $> == 0) {
-	$< = $> = getpwnam $opts{'u'};
+	$< = $> = getpwnam $opts{u};
 	syslog LOG_WARNING, "unable to drop root uid priv: $!"
 		if ($!);
 }
 #if ($( == 0 || $) == 0) {
-#	$( = $) = getgrnam $opts{'u'};
+#	$( = $) = getgrnam $opts{u};
 #	syslog LOG_WARNING, "unable to drop root gid priv: $!"
 #		if ($!);
 #}
 
 # the server address does not really matter, so we pick 0.0.0.0
 # as it is impossible that anything else would use this
-my $ipxSrvNode = unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{'p'}));
+my $ipxSrvNode = unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{p}));
 
 my (%clients, %ignore);
 my $running = 1;
 my $lastTs = time;
 
-$SIG{'INT'}=$SIG{'TERM'}=\&sigTERM;
-$SIG{'HUP'}=\&sigHUP;
+$SIG{INT}=$SIG{TERM}=\&sigTERM;
+$SIG{HUP}=\&sigHUP;
 
 while ($running) {
 	# IPX packet cannot be bigger than 1500 - 40(ip) - 8(udp)
@@ -204,11 +204,11 @@ while ($running) {
 		# do anyway to mop up regularly disconnected users, as the
 		# clients do not inform the server when they go away. 
 		foreach my $client (keys %clients) {
-			next if ($clients{$client}{'ts'} > $ts - $opts{'i'});
+			next if ($clients{$client}{ts} > $ts - $opts{i});
 
-			syslog LOG_INFO, '[' . $clients{$client}{'ip'} . ']'
+			syslog LOG_INFO, '[' . $clients{$client}{ip} . ']'
 						. ' idle timeout for '
-						. $clients{$client}{'node'};
+						. $clients{$client}{node};
 			delete $clients{$client};
 		}
 
@@ -227,8 +227,8 @@ while ($running) {
 
 	#print Dumper $d;
 
-	my $respond = ($d->{'dst'}{'node'} eq $ipxSrvNode
-			|| $d->{'dst'}{'node'} eq 'ffffffffffff');
+	my $respond = ($d->{dst}{node} eq $ipxSrvNode
+			|| $d->{dst}{node} eq 'ffffffffffff');
 	# registration packet
 	if (!$respond && &isReg($d)) {
 		# we *cannot* delete the previous registeration otherwise
@@ -252,22 +252,22 @@ while ($running) {
 		}
 
 		# reverse path filtering
-		unless ($d->{'src'}{'node'} eq $clients{"$srcaddr:$srcport"}{'node'}) {
+		unless ($d->{src}{node} eq $clients{"$srcaddr:$srcport"}{node}) {
 			syslog LOG_ERR, "[$srcaddr] reverse path filtering failure(s)"
 				unless (defined($ignore{$srcaddr}));
 			$ignore{$srcaddr} = $ts;
 			next;
 		}
 
-		$clients{"$srcaddr:$srcport"}{'ts'} = $ts;
+		$clients{"$srcaddr:$srcport"}{ts} = $ts;
 
-		syslog LOG_DEBUG, "[$srcaddr] pkt " . $d->{'src'}{'node'}
-					. ' > ' . $d->{'dst'}{'node'};
+		syslog LOG_DEBUG, "[$srcaddr] pkt " . $d->{src}{node}
+					. ' > ' . $d->{dst}{node};
 
-		my @dest = ($d->{'dst'}{'node'} eq 'ffffffffffff')
-			? grep { $clients{$_}{'node'} ne $d->{'src'}{'node'} }
+		my @dest = ($d->{dst}{node} eq 'ffffffffffff')
+			? grep { $clients{$_}{node} ne $d->{src}{node} }
 				keys %clients
-			: grep { $clients{$_}{'node'} eq $d->{'dst'}{'node'} }
+			: grep { $clients{$_}{node} eq $d->{dst}{node} }
 				keys %clients;
 
 		# N.B. we do not increment transport control as really
@@ -275,14 +275,14 @@ while ($running) {
 		# TODO handle errors (mtu?) rather than just report them
 		foreach my $dst (@dest) {
 			my $n = $sock->send($payload, MSG_DONTWAIT,
-						$clients{$dst}{'paddr'});
+						$clients{$dst}{paddr});
 			unless (defined($n)) {
-				syslog LOG_ERR, '[' . $clients{$dst}{'ip'} . ']'
+				syslog LOG_ERR, '[' . $clients{$dst}{ip} . ']'
 						. 'unable to sendto()';
 				next;
 			}
 			unless ($n == length($payload)) {
-				syslog LOG_ERR, '[' . $clients{$dst}{'ip'} . ']'
+				syslog LOG_ERR, '[' . $clients{$dst}{ip} . ']'
 						. 'unable to sendto() complete payload';
 				next;
 			}
@@ -292,14 +292,14 @@ while ($running) {
 	next unless ($respond);
 
 	# ping
-	if ($d->{'src'}{'sock'} == 2 && $d->{'dst'}{'sock'} == 2) {
+	if ($d->{src}{sock} == 2 && $d->{dst}{sock} == 2) {
 		# registration hack
-		syslog LOG_INFO, "[$srcaddr] echo req from " . $d->{'src'}{'node'}
-			unless ($d->{'src'}{'node'} eq '000000000000');
+		syslog LOG_INFO, "[$srcaddr] echo req from " . $d->{src}{node}
+			unless ($d->{src}{node} eq '000000000000');
 
 		my $reply = pack 'nnCCH8H12nH8H12na*',
 			0xffff, 30, 0, 2,
-			'00000000', $clients{"$srcaddr:$srcport"}{'node'}, 2,
+			'00000000', $clients{"$srcaddr:$srcport"}{node}, 2,
 			'00000000', $ipxSrvNode, 2;
 
 		# N.B. we do not check that the whole packet has been sent,
@@ -307,7 +307,7 @@ while ($running) {
 		#	30 byte payload
 		# TODO handle errors (mtu?) rather than just report them
 		my $n = $sock->send($reply, MSG_DONTWAIT,
-					$clients{"$srcaddr:$srcport"}{'paddr'});
+					$clients{"$srcaddr:$srcport"}{paddr});
 		unless (defined($n)) {
 			syslog LOG_ERR, "[$srcaddr] unable to sendto()";
 			next;
@@ -338,7 +338,7 @@ sub sigHUP {
 
 sub openSocket {
 	my %args = (
-		LocalPort	=> $opts{'p'},
+		LocalPort	=> $opts{p},
 		Proto		=> 'udp'
 	);
 
@@ -370,34 +370,34 @@ sub ipxDecode {
 	}
 
 	my %d;
-	($d{'cksum'}, $d{'len'}, $d{'hl'}, $d{'type'},
-		$d{'dst'}{'net'}, $d{'dst'}{'node'}, $d{'dst'}{'sock'},
-		$d{'src'}{'net'}, $d{'src'}{'node'}, $d{'src'}{'sock'},
-		$d{'payload'} ) = unpack 'nnCCH8H12nH8H12na*', $packet;
+	($d{cksum}, $d{len}, $d{hl}, $d{type},
+		$d{dst}{net}, $d{dst}{node}, $d{dst}{sock},
+		$d{src}{net}, $d{src}{node}, $d{src}{sock},
+		$d{payload} ) = unpack 'nnCCH8H12nH8H12na*', $packet;
 
-	unless (defined($d{'payload'})) {
+	unless (defined($d{payload})) {
 		syslog LOG_WARNING, "[$srcaddr] unable to unpack() packet";
 		return;
 	}
 
-	unless ($d{'cksum'} == 0xffff) {
+	unless ($d{cksum} == 0xffff) {
 		syslog LOG_WARNING, "[$srcaddr] cksum != 0xffff";
 		return;
 	}
-	unless ($d{'len'} == 30 + length($d{'payload'})) {
+	unless ($d{len} == 30 + length($d{payload})) {
 		syslog LOG_WARNING, "[$srcaddr] length != header + payload";
 		return;
 	}
-	unless ($d{'src'}{'net'} eq '00000000') {
+	unless ($d{src}{net} eq '00000000') {
 		syslog LOG_WARNING, "[$srcaddr] src not net zero traffic";
 		return;
 	}
-	unless ($d{'dst'}{'net'} eq '00000000') {
+	unless ($d{dst}{net} eq '00000000') {
 		syslog LOG_WARNING, "[$srcaddr] dst not net zero traffic";
 		return;
 	}
 	# HACK clause for the registration packets
-	if ($d{'src'}{'node'} eq $d{'dst'}{'node'} && !&isReg(\%d)) {
+	if ($d{src}{node} eq $d{dst}{node} && !&isReg(\%d)) {
 		syslog LOG_ERR, "[$srcaddr] LAND attack packet";
 		return;
 	}
@@ -411,13 +411,13 @@ sub isReg {
 	# we ignore 'type' as it seems that:
 	#  * dosbox 0.72 => type = (not initialised - garbage)
 	#  * dosbox 0.73 => type = 0
-	return ($d->{'hl'} == 0 && $d->{'len'} == 30
-			&& $d->{'src'}{'net'} eq $d->{'dst'}{'net'}
-			&& $d->{'src'}{'node'} eq $d->{'dst'}{'node'}
-			&& $d->{'src'}{'sock'} == $d->{'dst'}{'sock'}
-			&& $d->{'src'}{'net'} eq '00000000'
-			&& $d->{'src'}{'node'} eq '000000000000'
-			&& $d->{'src'}{'sock'} == 2);
+	return ($d->{hl} == 0 && $d->{len} == 30
+			&& $d->{src}{net} eq $d->{dst}{net}
+			&& $d->{src}{node} eq $d->{dst}{node}
+			&& $d->{src}{sock} == $d->{dst}{sock}
+			&& $d->{src}{net} eq '00000000'
+			&& $d->{src}{node} eq '000000000000'
+			&& $d->{src}{sock} == 2);
 }
 
 sub register {
@@ -479,7 +479,7 @@ First version conceived.
 
 =item B<20100124>
 
-Removed the '$d{'hl'} == 0' sanity check, GTA trips on this.
+Removed the '$d{hl} == 0' sanity check, GTA trips on this.
 Added a logging throttling mechanism for unknown hosts and
 RPF failures.
 
