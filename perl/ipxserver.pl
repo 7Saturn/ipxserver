@@ -26,6 +26,8 @@ use Sys::Syslog qw/:standard :macros/;
 use POSIX qw/setsid/;
 use Socket;
 use IO::Socket::INET;
+use feature 'signatures';
+no warnings qw(experimental::signatures);
 
 #use Data::Dumper;
 
@@ -130,7 +132,7 @@ die 'invalid port number to listen on (0 < n < 65536)'
 if (defined($opts{n})) {
 	openlog(basename($0), 'ndelay|pid|perror', "local$opts{l}");
 }
-else {  
+else {
 	# perlfaq8 - How do I fork a daemon process?
 	my $sid = setsid;
 	chdir '/';
@@ -202,7 +204,7 @@ while ($running) {
 		# disconnects), instead of listening for ICMP unreachables
 		# we simply timeout the connections which we would have to
 		# do anyway to mop up regularly disconnected users, as the
-		# clients do not inform the server when they go away. 
+		# clients do not inform the server when they go away.
 		foreach my $client (keys %clients) {
 			next if ($clients{$client}{ts} > $ts - $opts{i});
 
@@ -228,12 +230,13 @@ while ($running) {
 	my $respond = ($d->{dst}{node} eq $ipxSrvNode
 			|| $d->{dst}{node} eq 'ffffffffffff');
 	# registration packet
+	my $src_identifier = get_node_identifier($srcaddr, $srcport);
 	if (!$respond && &isReg($d)) {
 		# we *cannot* delete the previous registeration otherwise
 		# this gives bad users a perfect opportunity to effectively
 		# kick others off.  The other, although unlikely, cause is
 		# if the client OS (or NAT) re-uses the same source port.
-		if (defined($clients{"$srcaddr:$srcport"})) {
+		if (defined($clients{$src_identifier})) {
 			syslog LOG_WARNING, "[$srcaddr] re-registration, possibly spoofed DoS attempt";
 			next;
 		}
@@ -242,7 +245,7 @@ while ($running) {
 		$respond = 1;
 	}
 	else {
-		unless (defined($clients{"$srcaddr:$srcport"})) {
+		unless (defined($clients{$src_identifier})) {
 			syslog LOG_WARNING, "[$srcaddr] packet(s) from unregistered source"
 				unless (defined($ignore{$srcaddr}));
 			$ignore{$srcaddr} = $ts;
@@ -250,14 +253,14 @@ while ($running) {
 		}
 
 		# reverse path filtering
-		unless ($d->{src}{node} eq $clients{"$srcaddr:$srcport"}{node}) {
+		unless ($d->{src}{node} eq $clients{$src_identifier}{node}) {
 			syslog LOG_ERR, "[$srcaddr] reverse path filtering failure(s)"
 				unless (defined($ignore{$srcaddr}));
 			$ignore{$srcaddr} = $ts;
 			next;
 		}
 
-		$clients{"$srcaddr:$srcport"}{ts} = $ts;
+		$clients{$src_identifier}{ts} = $ts;
 
 		syslog LOG_DEBUG, "[$srcaddr] pkt $d->{src}{node} > $d->{dst}{node}";
 
@@ -294,7 +297,7 @@ while ($running) {
 
 		my $reply = pack 'nnCCH8H12nH8H12na*',
 			0xffff, 30, 0, 2,
-			'00000000', $clients{"$srcaddr:$srcport"}{node}, 2,
+			'00000000', $clients{$src_identifier}{node}, 2,
 			'00000000', $ipxSrvNode, 2;
 
 		# N.B. we do not check that the whole packet has been sent,
@@ -302,7 +305,7 @@ while ($running) {
 		#	30 byte payload
 		# TODO handle errors (mtu?) rather than just report them
 		my $n = $sock->send($reply, MSG_DONTWAIT,
-					$clients{"$srcaddr:$srcport"}{paddr});
+					$clients{$src_identifier}{paddr});
 		unless (defined($n)) {
 			syslog LOG_ERR, "[$srcaddr] unable to sendto()";
 			next;
@@ -346,7 +349,7 @@ sub openSocket {
 #		? IO::Socket::INET->new(%args)
 #		: IO::Socket::INET6->new(%args);
 	my $sock = IO::Socket::INET->new(%args);
-	
+
 	unless (defined($sock)) {
 		syslog LOG_CRIT, "could not open udp socket: $!";
 		return;
@@ -434,7 +437,8 @@ sub register {
 	#	If we end up doing this, it probably is safe to pay
 	#	attention to those 'ICMP unreachable' messages that come
 	#	back when we have a disconnected client
-	$clients->{"$srcaddr:$srcport"} = {
+	my $src_identifier = get_node_identifier($srcaddr, $srcport);
+	$clients->{$src_identifier} = {
 		ip	=> $srcaddr,
 		port	=> $srcport,
 
@@ -444,6 +448,13 @@ sub register {
 	};
 
 	syslog LOG_NOTICE, "[$srcaddr] registered client $node";
+}
+
+# For consistency reasons use this for creating an identifier. Maybe we will
+# change that format of identifiers in the future. If so, you only need to alter
+# this particular function. Not all occurences of identifiers...
+sub get_node_identifier ($addr, $port) {
+    return "$addr:$port";
 }
 
 __END__
@@ -506,4 +517,3 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 =cut
-
