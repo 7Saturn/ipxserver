@@ -66,6 +66,9 @@ Readonly my @DEBUG => (
 );
 
 Readonly my $base_verbosity => 5;
+Readonly my $cleanup_interval => 600;
+
+Readonly my $ipx_broadcast_node => 'ffffffffffff';
 
 =head1 OPTIONS
 
@@ -159,7 +162,7 @@ unless ($opts{p} > 0 && $opts{p} < 65536) {
                 'Invalid port number to listen on (0 < n < 65536)');
 }
 
-if (defined($opts{n})) {
+if (defined $opts{n}) {
 	openlog(basename($0), 'ndelay|pid|perror', "local$opts{l}");
 }
 else {
@@ -172,7 +175,7 @@ else {
 	open STDERR, '+>&STDIN';
 
 	my $pid = fork;
-    unless (defined($pid)) {
+    unless (defined $pid) {
         proper_exit($error_code{fork_failure},
                     "Unable to fork() as daemon: $!");
     }
@@ -203,7 +206,7 @@ my $sock = &openSocket();
 # lets make 'ps'/'netstat' look prettier
 $0 = basename($0);
 
-# After creating the socket, we longer need to run as root
+# After creating the socket, we no longer need to run as root
 if ($< == 0 || $> == 0) {
 	$< = $> = getpwnam $opts{u};
 	syslog LOG_WARNING, "Unable to drop root uid priv: $!"
@@ -223,10 +226,11 @@ my $ipxSrvNode = unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{p}));
 
 my (%clients, %ignore);
 my $running = 1;
-my $lastTs = time;
+my $cleanup_done_time = time;
 
 $SIG{INT}=$SIG{TERM}=\&sigTERM;
 $SIG{HUP}=\&sigHUP;
+$SIG{USR1}=\&sigUSR1;
 
 while ($running) {
 	# IPX packet cannot be bigger than 1500 - 40(ip) - 8(udp)
@@ -236,42 +240,43 @@ while ($running) {
 	next unless ($srcpaddr);
 
 	my $ts = time;
-	if ($lastTs < $ts - 600) {
+    if ($cleanup_done_time + $cleanup_interval < $ts) {
 		# to simplify the code (and to reduce possible spoofed
 		# disconnects), instead of listening for ICMP unreachables
 		# we simply timeout the connections which we would have to
 		# do anyway to mop up regularly disconnected users, as the
 		# clients do not inform the server when they go away.
-		foreach my $client (keys %clients) {
-			next if ($clients{$client}{ts} > $ts - $opts{i});
+        my $cleanup_timeout = $ts - $opts{i};
+        foreach my $client_identifier (keys %clients) {
+			next if $clients{$client_identifier}{ts} > $cleanup_timeout;
 
-			syslog LOG_INFO, "[$clients{$client}{ip}] idle timeout for $clients{$client}{node}";
-			delete $clients{$client};
+			syslog LOG_INFO, "[$clients{$client_identifier}{ip}] idle timeout for $clients{$client_identifier}{node}";
+			delete $clients{$client_identifier};
 		}
 
 		# every interval we check what we can mop up
 		delete $ignore{$_}
-			for grep { $ignore{$_} < $ts - 600 } keys %ignore;
+			for grep { $ignore{$_} + $cleanup_interval < $ts } keys %ignore;
 
-		$lastTs = $ts;
+		$cleanup_done_time = $ts;
 	}
 
 	my ($srcport, $srciaddr) = sockaddr_in $srcpaddr;
 	my $srcaddr = inet_ntoa $srciaddr;
 
-	my $d = &ipxDecode($srcaddr, $payload);
-	next unless (defined($d));
+	my $dgrm = &ipxDecode($srcaddr, $payload);
+	next unless defined $dgrm;
 
-	my $respond = ($d->{dst}{node} eq $ipxSrvNode
-			|| $d->{dst}{node} eq 'ffffffffffff');
+    my $respond = (   $dgrm->{dst}{node} eq $ipxSrvNode
+                   || $dgrm->{dst}{node} eq $ipx_broadcast_node);
 	# registration packet
 	my $src_identifier = get_node_identifier($srcaddr, $srcport);
-	if (!$respond && &isReg($d)) {
+	if (!$respond && isReg($dgrm)) {
 		# we *cannot* delete the previous registeration otherwise
 		# this gives bad users a perfect opportunity to effectively
 		# kick others off.  The other, although unlikely, cause is
 		# if the client OS (or NAT) re-uses the same source port.
-		if (defined($clients{$src_identifier})) {
+		if (exists $clients{$src_identifier}) {
 			syslog LOG_WARNING, "[$srcaddr] re-registration, possibly spoofed DoS attempt";
 			next;
 		}
@@ -280,43 +285,42 @@ while ($running) {
 		$respond = 1;
 	}
 	else {
-		unless (defined($clients{$src_identifier})) {
-			syslog LOG_WARNING, "[$srcaddr] packet(s) from unregistered source"
-				unless (defined($ignore{$srcaddr}));
+		unless (exists $clients{$src_identifier}) {
+            unless (defined $ignore{$srcaddr}) {
+                syslog LOG_WARNING, "[$srcaddr] packet(s) from unregistered source";
+            }
 			$ignore{$srcaddr} = $ts;
 			next;
 		}
 
 		# reverse path filtering
-		unless ($d->{src}{node} eq $clients{$src_identifier}{node}) {
-			syslog LOG_ERR, "[$srcaddr] reverse path filtering failure(s)"
-				unless (defined($ignore{$srcaddr}));
+		unless ($dgrm->{src}{node} eq $clients{$src_identifier}{node}) {
+            unless (defined $ignore{$srcaddr}) {
+                syslog LOG_ERR, "[$srcaddr] reverse path filtering failure(s)";
+            }
 			$ignore{$srcaddr} = $ts;
 			next;
 		}
 
 		$clients{$src_identifier}{ts} = $ts;
 
-		syslog LOG_DEBUG, "[$srcaddr] pkt $d->{src}{node} > $d->{dst}{node}";
+		syslog LOG_DEBUG, "[$srcaddr] pkt $dgrm->{src}{node} > $dgrm->{dst}{node}";
 
-		my @dest = ($d->{dst}{node} eq 'ffffffffffff')
-			? grep { $clients{$_}{node} ne $d->{src}{node} }
-				keys %clients
-			: grep { $clients{$_}{node} eq $d->{dst}{node} }
-				keys %clients;
+		my $destination_identifiers = get_destination_identifiers($dgrm);
 
 		# N.B. we do not increment transport control as really
 		#	we are acting as a switch
 		# TODO handle errors (mtu?) rather than just report them
-		foreach my $dst (@dest) {
-			my $n = $sock->send($payload, MSG_DONTWAIT,
-						$clients{$dst}{paddr});
-			unless (defined($n)) {
-				syslog LOG_ERR, "[$clients{$dst}{ip}] unable to sendto()";
+		foreach my $dest_identifier (@$destination_identifiers) {
+			my $n = $sock->send($payload,
+                                MSG_DONTWAIT,
+                                $clients{$dest_identifier}{paddr});
+			unless (defined $n ) {
+				syslog LOG_ERR, "[$clients{$dest_identifier}{ip}] unable to sendto()";
 				next;
 			}
 			unless ($n == length($payload)) {
-				syslog LOG_ERR, "[$clients{$dst}{ip}] unable to sendto() complete payload";
+				syslog LOG_ERR, "[$clients{$dest_identifier}{ip}] unable to sendto() complete payload";
 				next;
 			}
 		}
@@ -325,10 +329,11 @@ while ($running) {
 	next unless ($respond);
 
 	# ping
-	if ($d->{src}{sock} == 2 && $d->{dst}{sock} == 2) {
+	if ($dgrm->{src}{sock} == 2 && $dgrm->{dst}{sock} == 2) {
 		# registration hack
-		syslog LOG_INFO, "[$srcaddr] echo req from $d->{src}{node}"
-			unless ($d->{src}{node} eq '000000000000');
+        unless ($dgrm->{src}{node} eq '000000000000') {
+            syslog LOG_INFO, "[$srcaddr] echo req from $dgrm->{src}{node}";
+        }
 
 		my $reply = pack 'nnCCH8H12nH8H12na*',
 			0xffff, 30, 0, 2,
@@ -339,9 +344,10 @@ while ($running) {
 		#	as we have bigger problems if we cannot send a
 		#	30 byte payload
 		# TODO handle errors (mtu?) rather than just report them
-		my $n = $sock->send($reply, MSG_DONTWAIT,
-					$clients{$src_identifier}{paddr});
-		unless (defined($n)) {
+		my $n = $sock->send($reply,
+                            MSG_DONTWAIT,
+                            $clients{$src_identifier}{paddr});
+		unless (defined $n) {
 			syslog LOG_ERR, "[$srcaddr] unable to sendto()";
 			next;
 		}
@@ -353,6 +359,17 @@ $sock->close;
 syslog LOG_NOTICE, 'exited';
 
 proper_exit($error_code{all_ok});
+
+sub get_destination_identifiers ($datagram) {
+    my @client_identifiers = keys %clients;
+    my @destination_identifiers =
+        ($datagram->{dst}{node} eq $ipx_broadcast_node)
+        # Broadcasts got to everyone but the sender.
+        ? grep { $clients{$_}{node} ne $datagram->{src}{node} } @client_identifiers
+        # Rest goes specifically where it is supposed to go.
+        : grep { $clients{$_}{node} eq $datagram->{dst}{node} } @client_identifiers;
+    return \@destination_identifiers;
+}
 
 sub sigTERM {
 	my $signal = shift;
@@ -367,6 +384,19 @@ sub sigHUP {
 
 	syslog LOG_NOTICE, "caught SIGHUP, disconnecting all clients";
 	%clients = ();
+}
+
+sub sigUSR1 {
+	my $signal = shift;
+	syslog LOG_NOTICE, "caught SIGUSR1, listing all clients currently connected.";
+    my @client_identifiers = sort keys %clients;
+    my $counter = @client_identifiers;
+    foreach my $identifier (@client_identifiers) {
+        syslog LOG_NOTICE, "$identifier is connected.";
+    }
+    unless (@client_identifiers) {
+        syslog LOG_NOTICE, "Currently no clients connected.";
+    }
 }
 
 sub openSocket () {
@@ -397,56 +427,57 @@ sub openSocket () {
 sub ipxDecode ($srcaddr, $packet) {
 	unless (length($packet) >= 30) {
 		syslog LOG_WARNING, "[$srcaddr] packet too short";
-		return;
+		return undef;
 	}
 
-	my %d;
-	($d{cksum},    $d{len},       $d{hl},        $d{type},
-     $d{dst}{net}, $d{dst}{node}, $d{dst}{sock},
-     $d{src}{net}, $d{src}{node}, $d{src}{sock},
-     $d{payload} ) = unpack 'nnCCH8H12nH8H12na*', $packet;
+	my %dgrm;
+	($dgrm{cksum},    $dgrm{len},       $dgrm{hl},        $dgrm{type},
+     $dgrm{dst}{net}, $dgrm{dst}{node}, $dgrm{dst}{sock},
+     $dgrm{src}{net}, $dgrm{src}{node}, $dgrm{src}{sock},
+     $dgrm{payload} ) = unpack 'nnCCH8H12nH8H12na*', $packet;
 
-	unless (defined($d{payload})) {
+	unless (defined $dgrm{payload}) {
 		syslog LOG_WARNING, "[$srcaddr] unable to unpack() packet";
 		return;
 	}
 
-	unless ($d{cksum} == 0xffff) {
+	unless ($dgrm{cksum} == 0xffff) {
 		syslog LOG_WARNING, "[$srcaddr] cksum != 0xffff";
 		return;
 	}
-	unless ($d{len} == 30 + length($d{payload})) {
+	unless ($dgrm{len} == 30 + length($dgrm{payload})) {
 		syslog LOG_WARNING, "[$srcaddr] length != header + payload";
 		return;
 	}
-	unless ($d{src}{net} eq '00000000') {
+	unless ($dgrm{src}{net} eq '00000000') {
 		syslog LOG_WARNING, "[$srcaddr] src not net zero traffic";
 		return;
 	}
-	unless ($d{dst}{net} eq '00000000') {
+	unless ($dgrm{dst}{net} eq '00000000') {
 		syslog LOG_WARNING, "[$srcaddr] dst not net zero traffic";
 		return;
 	}
 	# HACK clause for the registration packets
-	if ($d{src}{node} eq $d{dst}{node} && !&isReg(\%d)) {
+	if ($dgrm{src}{node} eq $dgrm{dst}{node} && !isReg(\%dgrm)) {
 		syslog LOG_ERR, "[$srcaddr] LAND attack packet";
 		return;
 	}
 
-	return \%d;
+	return \%dgrm;
 }
 
 sub isReg ($d) {
 	# we ignore 'type' as it seems that:
 	#  * dosbox 0.72 => type = (not initialised - garbage)
 	#  * dosbox 0.73 => type = 0
-	return ($d->{hl} == 0 && $d->{len} == 30
-			&& $d->{src}{net} eq $d->{dst}{net}
-			&& $d->{src}{node} eq $d->{dst}{node}
-			&& $d->{src}{sock} == $d->{dst}{sock}
-			&& $d->{src}{net} eq '00000000'
-			&& $d->{src}{node} eq '000000000000'
-			&& $d->{src}{sock} == 2);
+    return (   $d->{hl}        == 0
+            && $d->{len}       == 30
+            && $d->{src}{net}  eq $d->{dst}{net}
+            && $d->{src}{net}  eq '00000000'
+            && $d->{src}{node} eq $d->{dst}{node}
+            && $d->{src}{node} eq '000000000000'
+            && $d->{src}{sock} == $d->{dst}{sock}
+            && $d->{src}{sock} == 2);
 }
 
 sub register ($clients, $ts, $srcaddr, $srcport) {
@@ -465,12 +496,11 @@ sub register ($clients, $ts, $srcaddr, $srcport) {
 	#	back when we have a disconnected client
 	my $src_identifier = get_node_identifier($srcaddr, $srcport);
 	$clients->{$src_identifier} = {
-		ip	=> $srcaddr,
-		port	=> $srcport,
-
-		node	=> $node,
-		paddr	=> $paddr,
-		ts	=> $ts,
+        ip    => $srcaddr,
+        port  => $srcport,
+        node  => $node,
+        paddr => $paddr,
+        ts	  => $ts, # Time stamp when this client has sent the last time
 	};
 
 	syslog LOG_NOTICE, "[$srcaddr] registered client $node";
