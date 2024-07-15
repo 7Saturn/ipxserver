@@ -34,6 +34,26 @@ use Readonly;
 
 my $VERSION = '20100124';
 
+Readonly my %error_code =>
+    (
+     all_ok              => 0,
+     socket_fault        => 1,
+     cli_parameter_fault => 2,
+     fork_failure        => 3,
+    );
+
+sub proper_exit ($error_code, $message = undef) {
+    if (defined $message) {
+        if ($error_code{all_ok} != $error_code) {
+            say STDERR $message;
+        }
+        else {
+            say STDOUT $message;
+        }
+    }
+    exit $error_code;
+}
+
 Readonly my @DEBUG => (
 	LOG_EMERG,	# system is unusable
 	LOG_ALERT,	# action must be taken immediately
@@ -112,25 +132,32 @@ my %opts = (
 	i	=> 1800,
 );
 GetOptions(
-	'h|help'	=> sub { pod2usage(-exitval => 0) },
-	'man'		=> sub { pod2usage(-exitval => 0, -verbose => 2) },
-	'V|version'	=> sub { pod2usage(-exitval => 0, -message => "ipxserver - version $VERSION\n") },
+    'h|help'    => sub { pod2usage(-exitval => $error_code{all_ok}) },
+    'man'       => sub { pod2usage(-exitval => $error_code{all_ok},
+                                   -verbose => 2) },
+    'V|version' => sub { pod2usage(-exitval => $error_code{all_ok},
+                                   -message => "ipxserver - version $VERSION\n") },
 
-	'v+'		=> \$opts{v},
-	'q+'		=> \$opts{q},
+    'v+'        => \$opts{v},
+    'q+'        => \$opts{q},
 
-	'l|log=i'	=> \$opts{l},
-	'p|port=i'	=> \$opts{p},
-	'u|user=s'	=> \$opts{u},
-	'i|idle=i'	=> \$opts{i},
+    'l|log=i'   => \$opts{l},
+    'p|port=i'  => \$opts{p},
+    'u|user=s'  => \$opts{u},
+    'i|idle=i'  => \$opts{i},
 
-	'n|no-fork'	=> \$opts{n},
+    'n|no-fork' => \$opts{n},
 ) || pod2usage(2);
 
-die 'invalid facility log value (0 <= n < 8)'
-	unless ($opts{l} >= 0 && $opts{l} < 8);
-die 'invalid port number to listen on (0 < n < 65536)'
-	unless ($opts{p} > 0 && $opts{p} < 65536);
+
+unless ($opts{l} >= 0 && $opts{l} < 8) {
+    proper_exit($error_code{cli_parameter_fault},
+                'Invalid SYSLOG facility value (0 <= n < 8)');
+}
+unless ($opts{p} > 0 && $opts{p} < 65536) {
+    proper_exit($error_code{cli_parameter_fault},
+                'Invalid port number to listen on (0 < n < 65536)');
+}
 
 if (defined($opts{n})) {
 	openlog(basename($0), 'ndelay|pid|perror', "local$opts{l}");
@@ -145,10 +172,13 @@ else {
 	open STDERR, '+>&STDIN';
 
 	my $pid = fork;
-	die "unable to fork() as daemon: $!"
-		unless (defined($pid));
-
-	exit 0 if ($pid != 0);
+    unless (defined($pid)) {
+        proper_exit($error_code{fork_failure},
+                    "Unable to fork() as daemon: $!");
+    }
+    if ($pid != 0) {
+        proper_exit($error_code{all_ok});
+    }
 
 	openlog(basename($0), 'ndelay|pid', "local$opts{l}");
 
@@ -157,24 +187,26 @@ else {
 
 if ($base_verbosity + $opts{v} - $opts{q} >= scalar(@DEBUG)) {
 	setlogmask(LOG_UPTO(LOG_DEBUG));
-} elsif ($base_verbosity + $opts{v} - $opts{q} < 0) {
+}
+elsif ($base_verbosity + $opts{v} - $opts{q} < 0) {
 	setlogmask(LOG_UPTO(LOG_EMERG));
-} else {
+}
+else {
 	setlogmask(LOG_UPTO($DEBUG[$base_verbosity + $opts{v} - $opts{q}]));
 }
 
 my $sock = &openSocket();
-exit 1 unless ($sock);
 
-# TODO use Net::UPnP to request the port fowarding
+# TODO use Net::UPnP to request the port fowarding --> I don't think so. If you
+# intend to run a server, do it properly!
 
 # lets make 'ps'/'netstat' look prettier
 $0 = basename($0);
 
-# no longer need root
+# After creating the socket, we longer need to run as root
 if ($< == 0 || $> == 0) {
 	$< = $> = getpwnam $opts{u};
-	syslog LOG_WARNING, "unable to drop root uid priv: $!"
+	syslog LOG_WARNING, "Unable to drop root uid priv: $!"
 		if ($!);
 }
 #if ($( == 0 || $) == 0) {
@@ -185,6 +217,8 @@ if ($< == 0 || $> == 0) {
 
 # the server address does not really matter, so we pick 0.0.0.0
 # as it is impossible that anything else would use this
+# --> Actually it means listening on all network interfaces with IPv4...
+# We could use this at some point to tie the server to a specific interface.
 my $ipxSrvNode = unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{p}));
 
 my (%clients, %ignore);
@@ -227,8 +261,6 @@ while ($running) {
 
 	my $d = &ipxDecode($srcaddr, $payload);
 	next unless (defined($d));
-
-	#print Dumper $d;
 
 	my $respond = ($d->{dst}{node} eq $ipxSrvNode
 			|| $d->{dst}{node} eq 'ffffffffffff');
@@ -320,7 +352,7 @@ $sock->close;
 
 syslog LOG_NOTICE, 'exited';
 
-exit 0;
+proper_exit($error_code{all_ok});
 
 sub sigTERM {
 	my $signal = shift;
@@ -343,20 +375,21 @@ sub openSocket () {
 		Proto		=> 'udp'
 	);
 
-# as dosbox is not v6 enabled... :-/
-#	eval {
-#		require Socket6;
-#		require IO::Socket::INET6;
-#	};
-#	my $sock = ($@)
-#		? IO::Socket::INET->new(%args)
-#		: IO::Socket::INET6->new(%args);
+    # as dosbox is not v6 enabled... :-/
+    #	eval {
+    #		require Socket6;
+    #		require IO::Socket::INET6;
+    #	};
+    #	my $sock = ($@)
+    #		? IO::Socket::INET->new(%args)
+    #		: IO::Socket::INET6->new(%args);
 	my $sock = IO::Socket::INET->new(%args);
-
-	unless (defined($sock)) {
-		syslog LOG_CRIT, "could not open udp socket: $!";
-		return;
-	}
+    unless (defined $sock) {
+        my $error_message = "Could not open UDP socket: $!";
+        syslog LOG_CRIT, $error_message;
+        proper_exit($error_code{socket_fault},
+                    $error_message);
+    }
 
 	return $sock;
 }
@@ -368,10 +401,10 @@ sub ipxDecode ($srcaddr, $packet) {
 	}
 
 	my %d;
-	($d{cksum}, $d{len}, $d{hl}, $d{type},
-		$d{dst}{net}, $d{dst}{node}, $d{dst}{sock},
-		$d{src}{net}, $d{src}{node}, $d{src}{sock},
-		$d{payload} ) = unpack 'nnCCH8H12nH8H12na*', $packet;
+	($d{cksum},    $d{len},       $d{hl},        $d{type},
+     $d{dst}{net}, $d{dst}{node}, $d{dst}{sock},
+     $d{src}{net}, $d{src}{node}, $d{src}{sock},
+     $d{payload} ) = unpack 'nnCCH8H12nH8H12na*', $packet;
 
 	unless (defined($d{payload})) {
 		syslog LOG_WARNING, "[$srcaddr] unable to unpack() packet";
@@ -465,6 +498,32 @@ pkill -HUP ipxserver
 =item shutdown
 
 pkill ipxserver
+
+=back
+
+=head1 ERROR CODES
+
+=over 4
+
+=item 0
+
+Everything went fine, normal operations until normal shutdown.
+
+=item 1
+
+Could not open socket. Usually that means either there is not network interface
+with IPv4 active or the UDP port meant to be used is already used by another
+process.
+
+=item 2
+
+Command line parameter faulty. This means, the provided CLI parameters are
+somehow wrong/unusable.
+
+=item 3
+
+Fork failure: The child process could not be spawned. Usually that means
+something external is wrong, e.g. not enough RAM left to duplicate the process.
 
 =back
 
