@@ -45,10 +45,10 @@ Readonly my %error_code =>
 sub proper_exit ($error_code, $message = undef) {
     if (defined $message) {
         if ($error_code{all_ok} != $error_code) {
-            say STDERR $message;
+            print STDERR "$message\n";
         }
         else {
-            say STDOUT $message;
+            print STDOUT "$message\n";
         }
     }
     exit $error_code;
@@ -255,16 +255,25 @@ while ($running) {
 	my $srcpaddr = $sock->recv(my $payload, $max_ipx_payload_size, 0);
 
 	# if there has been a signal, this is undef
-	next unless ($srcpaddr);
+	next unless $srcpaddr;
 
 	my $ts = time;
-    if ($cleanup_done_time + $cleanup_interval < $ts) {
+    my $max_ts_without_cleanup = $cleanup_done_time + $cleanup_interval;
+    # The blocking from above also implies, the cleanup never happens, unless
+    # some package is received after exceeding the cleanup time.
+    # This means, the client list may contain a number of zombies for a long
+    # time, if nobody ever comes around and sends something to us after they
+    # expire.
+    if ($max_ts_without_cleanup < $ts) {
 		# to simplify the code (and to reduce possible spoofed
 		# disconnects), instead of listening for ICMP unreachables
 		# we simply timeout the connections which we would have to
 		# do anyway to mop up regularly disconnected users, as the
 		# clients do not inform the server when they go away.
         my $cleanup_timeout = $ts - $opts{i};
+        syslog LOG_INFO,
+            "Cleanup time $max_ts_without_cleanup exceeded. Cleaning up...";
+
         foreach my $client_identifier (keys %clients) {
 			next if $clients{$client_identifier}{ts} > $cleanup_timeout;
 
@@ -291,7 +300,7 @@ while ($running) {
 	my $src_identifier = get_node_identifier($srcaddr, $srcport);
 	# registration packet
 	if (!$respond && isReg($dgrm)) {
-		# we *cannot* delete the previous registeration otherwise
+		# we *cannot* delete the previous registration otherwise
 		# this gives bad users a perfect opportunity to effectively
 		# kick others off.  The other, although unlikely, cause is
 		# if the client OS (or NAT) re-uses the same source port.
@@ -332,17 +341,7 @@ while ($running) {
 		#	we are acting as a switch
 		# TODO handle errors (mtu?) rather than just report them
 		foreach my $dest_identifier (@$destination_identifiers) {
-			my $n = $sock->send($payload,
-                                MSG_DONTWAIT,
-                                $clients{$dest_identifier}{paddr});
-			unless (defined $n) {
-				syslog LOG_ERR, "[$clients{$dest_identifier}{ip}] unable to sendto()";
-				next;
-			}
-			unless ($n == length($payload)) {
-				syslog LOG_ERR, "[$clients{$dest_identifier}{ip}] unable to sendto() complete payload";
-				next;
-			}
+			sock_send($payload => $dest_identifier);
 		}
 	}
 
@@ -361,17 +360,7 @@ while ($running) {
 			$ipx_local_network,  $clients{$src_identifier}{node}, $error_handling_packet,
 			$ipx_local_network,  $ipxSrvNode,                     $error_handling_packet;
 
-		# N.B. we do not check that the whole packet has been sent,
-		#	as we have bigger problems if we cannot send a
-		#	30 byte payload
-		# TODO handle errors (mtu?) rather than just report them
-		my $n = $sock->send($reply,
-                            MSG_DONTWAIT,
-                            $clients{$src_identifier}{paddr});
-		unless (defined $n) {
-			syslog LOG_ERR, "[$srcaddr] unable to sendto()";
-			next;
-		}
+		sock_send($reply => $src_identifier);
 	}
 }
 
@@ -443,6 +432,21 @@ sub openSocket () {
     }
 
 	return $sock;
+}
+
+sub sock_send ($payload, $recipient_identifier) {
+    # TODO handle errors (mtu?) rather than just report them
+    my $sent_count = $sock->send($payload,
+                                 MSG_DONTWAIT, # = Non-blocking
+                                 $clients{$recipient_identifier}{paddr});
+    unless (defined $sent_count) {
+        syslog LOG_ERR, "[$recipient_identifier] unable to send: $@";
+        return;
+    }
+    unless ($sent_count == length($payload)) {
+        syslog LOG_ERR,
+            "[$recipient_identifier] unable to send complete payload.";
+    }
 }
 
 sub ipxDecode ($srcaddr, $packet) {
@@ -521,11 +525,11 @@ sub register ($clients, $ts, $srcaddr, $srcport) {
 	#	back when we have a disconnected client
 	my $src_identifier = get_node_identifier($srcaddr, $srcport);
 	$clients->{$src_identifier} = {
-        ip    => $srcaddr,
-        port  => $srcport,
-        node  => $node,
-        paddr => $paddr,
-        ts	  => $ts, # Time stamp when this client has sent the last time
+        ip    => $srcaddr, # e.g. 192.168.0.2
+        port  => $srcport, # e.g. 58619
+        node  => $node,    # e.g. c0a80002e4fb
+        paddr => $paddr,   # Binary represantation of port and address
+        ts    => $ts,      # epoch Time when this client has sent the last time
 	};
 
 	syslog LOG_NOTICE, "[$srcaddr] registered client $node";
