@@ -55,20 +55,39 @@ sub proper_exit ($error_code, $message = undef) {
 }
 
 Readonly my @DEBUG => (
-	LOG_EMERG,	# system is unusable
-	LOG_ALERT,	# action must be taken immediately
-	LOG_CRIT,	# critical conditions
-	LOG_ERR,	# error conditions
-	LOG_WARNING,	# warning conditions
-	LOG_NOTICE,	# normal, but significant, condition, see $base_verbosity
-	LOG_INFO,	# informational message
-	LOG_DEBUG	# verbose-level message
+    LOG_EMERG,   # system is unusable
+    LOG_ALERT,   # action must be taken immediately
+    LOG_CRIT,    # critical conditions
+    LOG_ERR,     # error conditions
+    LOG_WARNING, # warning conditions
+    LOG_NOTICE,  # normal, but significant, condition, see $base_verbosity
+    LOG_INFO,    # informational message
+    LOG_DEBUG    # verbose-level message
 );
 
 Readonly my $base_verbosity => 5;
 Readonly my $cleanup_interval => 600;
 
+#This is a fixed definition by the IPX protocol:
+Readonly my $ipx_header_length => 30;
+# Everyone is addressed, meaning, even we will respond to those calls:
 Readonly my $ipx_broadcast_node => 'ffffffffffff';
+# The IPX pendant to Ping has this type:
+Readonly my $echo_protocol_packet => 2;
+# Pings and registrations use this socket:
+Readonly my $error_handling_packet => 2;
+# IPX does not calculate checksums, so this is always constant:
+Readonly my $ipx_checksum_const => 0xffff;
+# We will not work with IPX routers.
+# So the network communicated with must be the local one:
+Readonly my $ipx_local_network => '00000000';
+# And there will be not hops for routing necessary.
+Readonly my $max_hop_count => 0;
+# IPX packet cannot be bigger than 1500(MTU) - 40(IP) - 8(UDP)
+Readonly my $max_ipx_payload_size => 1452;
+# Registration uses fake source and destination nodes. If we receive those via
+# UDP, then it's an attempt to register with us:
+Readonly my $fake_node => '000000000000';
 
 =head1 OPTIONS
 
@@ -150,7 +169,7 @@ GetOptions(
     'i|idle=i'  => \$opts{i},
 
     'n|no-fork' => \$opts{n},
-) || pod2usage(2);
+) || pod2usage($error_code{cli_parameter_fault});
 
 
 unless ($opts{l} >= 0 && $opts{l} < 8) {
@@ -200,9 +219,6 @@ else {
 
 my $sock = &openSocket();
 
-# TODO use Net::UPnP to request the port fowarding --> I don't think so. If you
-# intend to run a server, do it properly!
-
 # lets make 'ps'/'netstat' look prettier
 $0 = basename($0);
 
@@ -222,7 +238,8 @@ if ($< == 0 || $> == 0) {
 # as it is impossible that anything else would use this
 # --> Actually it means listening on all network interfaces with IPv4...
 # We could use this at some point to tie the server to a specific interface.
-my $ipxSrvNode = unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{p}));
+# As long as we are running, the port and address will not change...
+Readonly my $ipxSrvNode => unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{p}));
 
 my (%clients, %ignore);
 my $running = 1;
@@ -233,8 +250,9 @@ $SIG{HUP}=\&sigHUP;
 $SIG{USR1}=\&sigUSR1;
 
 while ($running) {
-	# IPX packet cannot be bigger than 1500 - 40(ip) - 8(udp)
-	my $srcpaddr = $sock->recv(my $payload, 1452, 0);
+    # This is blocking. So unless we have traffic, this service will basically
+    # not use up any CPU time, making it very light-weight.
+	my $srcpaddr = $sock->recv(my $payload, $max_ipx_payload_size, 0);
 
 	# if there has been a signal, this is undef
 	next unless ($srcpaddr);
@@ -250,7 +268,7 @@ while ($running) {
         foreach my $client_identifier (keys %clients) {
 			next if $clients{$client_identifier}{ts} > $cleanup_timeout;
 
-			syslog LOG_INFO, "[$clients{$client_identifier}{ip}] idle timeout for $clients{$client_identifier}{node}";
+			syslog LOG_NOTICE, "[$clients{$client_identifier}{ip}] idle timeout for $clients{$client_identifier}{node}";
 			delete $clients{$client_identifier};
 		}
 
@@ -267,10 +285,11 @@ while ($running) {
 	my $dgrm = &ipxDecode($srcaddr, $payload);
 	next unless defined $dgrm;
 
+    # Are they addressing us ourselves?
     my $respond = (   $dgrm->{dst}{node} eq $ipxSrvNode
                    || $dgrm->{dst}{node} eq $ipx_broadcast_node);
-	# registration packet
 	my $src_identifier = get_node_identifier($srcaddr, $srcport);
+	# registration packet
 	if (!$respond && isReg($dgrm)) {
 		# we *cannot* delete the previous registeration otherwise
 		# this gives bad users a perfect opportunity to effectively
@@ -282,6 +301,7 @@ while ($running) {
 		}
 
 		&register(\%clients, $ts, $srcaddr, $srcport);
+        # After registration we have to respond, too.
 		$respond = 1;
 	}
 	else {
@@ -315,7 +335,7 @@ while ($running) {
 			my $n = $sock->send($payload,
                                 MSG_DONTWAIT,
                                 $clients{$dest_identifier}{paddr});
-			unless (defined $n ) {
+			unless (defined $n) {
 				syslog LOG_ERR, "[$clients{$dest_identifier}{ip}] unable to sendto()";
 				next;
 			}
@@ -328,17 +348,18 @@ while ($running) {
 
 	next unless ($respond);
 
-	# ping
-	if ($dgrm->{src}{sock} == 2 && $dgrm->{dst}{sock} == 2) {
+    my $is_ping = (   $dgrm->{src}{sock} == $error_handling_packet
+                   && $dgrm->{dst}{sock} == $error_handling_packet);
+	if ($is_ping) {
 		# registration hack
-        unless ($dgrm->{src}{node} eq '000000000000') {
+        unless ($dgrm->{src}{node} eq $fake_node) {
             syslog LOG_INFO, "[$srcaddr] echo req from $dgrm->{src}{node}";
         }
 
 		my $reply = pack 'nnCCH8H12nH8H12na*',
-			0xffff, 30, 0, 2,
-			'00000000', $clients{$src_identifier}{node}, 2,
-			'00000000', $ipxSrvNode, 2;
+			$ipx_checksum_const, $ipx_header_length,              $max_hop_count, $echo_protocol_packet,
+			$ipx_local_network,  $clients{$src_identifier}{node}, $error_handling_packet,
+			$ipx_local_network,  $ipxSrvNode,                     $error_handling_packet;
 
 		# N.B. we do not check that the whole packet has been sent,
 		#	as we have bigger problems if we cannot send a
@@ -364,7 +385,7 @@ sub get_destination_identifiers ($datagram) {
     my @client_identifiers = keys %clients;
     my @destination_identifiers =
         ($datagram->{dst}{node} eq $ipx_broadcast_node)
-        # Broadcasts got to everyone but the sender.
+        # Broadcasts go to everyone but the sender.
         ? grep { $clients{$_}{node} ne $datagram->{src}{node} } @client_identifiers
         # Rest goes specifically where it is supposed to go.
         : grep { $clients{$_}{node} eq $datagram->{dst}{node} } @client_identifiers;
@@ -392,7 +413,7 @@ sub sigUSR1 {
     my @client_identifiers = sort keys %clients;
     my $counter = @client_identifiers;
     foreach my $identifier (@client_identifiers) {
-        syslog LOG_NOTICE, "$identifier is connected.";
+        syslog LOG_NOTICE, "$identifier is considered connected.";
     }
     unless (@client_identifiers) {
         syslog LOG_NOTICE, "Currently no clients connected.";
@@ -425,41 +446,45 @@ sub openSocket () {
 }
 
 sub ipxDecode ($srcaddr, $packet) {
-	unless (length($packet) >= 30) {
+	if (length($packet) < $ipx_header_length) {
 		syslog LOG_WARNING, "[$srcaddr] packet too short";
 		return undef;
 	}
 
 	my %dgrm;
-	($dgrm{cksum},    $dgrm{len},       $dgrm{hl},        $dgrm{type},
+    ($dgrm{cksum},    $dgrm{len},       $dgrm{hop_count}, $dgrm{type},
      $dgrm{dst}{net}, $dgrm{dst}{node}, $dgrm{dst}{sock},
      $dgrm{src}{net}, $dgrm{src}{node}, $dgrm{src}{sock},
-     $dgrm{payload} ) = unpack 'nnCCH8H12nH8H12na*', $packet;
+     $dgrm{payload})
+        = unpack 'nnCCH8H12nH8H12na*', $packet;
 
 	unless (defined $dgrm{payload}) {
 		syslog LOG_WARNING, "[$srcaddr] unable to unpack() packet";
 		return;
 	}
 
-	unless ($dgrm{cksum} == 0xffff) {
+	unless ($dgrm{cksum} == $ipx_checksum_const) {
 		syslog LOG_WARNING, "[$srcaddr] cksum != 0xffff";
 		return;
 	}
-	unless ($dgrm{len} == 30 + length($dgrm{payload})) {
+	unless ($dgrm{len} == $ipx_header_length + length($dgrm{payload})) {
 		syslog LOG_WARNING, "[$srcaddr] length != header + payload";
 		return;
 	}
-	unless ($dgrm{src}{net} eq '00000000') {
+    # We will not route IPX. So other networks are taboo.
+	unless ($dgrm{src}{net} eq $ipx_local_network) {
 		syslog LOG_WARNING, "[$srcaddr] src not net zero traffic";
 		return;
 	}
-	unless ($dgrm{dst}{net} eq '00000000') {
+	unless ($dgrm{dst}{net} eq $ipx_local_network) {
 		syslog LOG_WARNING, "[$srcaddr] dst not net zero traffic";
 		return;
 	}
 	# HACK clause for the registration packets
 	if ($dgrm{src}{node} eq $dgrm{dst}{node} && !isReg(\%dgrm)) {
 		syslog LOG_ERR, "[$srcaddr] LAND attack packet";
+        # Troublemakers will be ignored for the $cleanup_interval
+        $ignore{$srcaddr} = time;
 		return;
 	}
 
@@ -470,14 +495,14 @@ sub isReg ($d) {
 	# we ignore 'type' as it seems that:
 	#  * dosbox 0.72 => type = (not initialised - garbage)
 	#  * dosbox 0.73 => type = 0
-    return (   $d->{hl}        == 0
-            && $d->{len}       == 30
+    return (   $d->{hop_count} == $max_hop_count
+            && $d->{len}       == $ipx_header_length
             && $d->{src}{net}  eq $d->{dst}{net}
-            && $d->{src}{net}  eq '00000000'
+            && $d->{src}{net}  eq $ipx_local_network
             && $d->{src}{node} eq $d->{dst}{node}
-            && $d->{src}{node} eq '000000000000'
+            && $d->{src}{node} eq $fake_node
             && $d->{src}{sock} == $d->{dst}{sock}
-            && $d->{src}{sock} == 2);
+            && $d->{src}{sock} == $error_handling_packet);
 }
 
 sub register ($clients, $ts, $srcaddr, $srcport) {
@@ -567,7 +592,7 @@ First version conceived.
 
 =item B<20100124>
 
-Removed the '$d{hl} == 0' sanity check, GTA trips on this.
+Removed the '$d{hop_count} == 0' sanity check, GTA trips on this.
 Added a logging throttling mechanism for unknown hosts and
 RPF failures.
 
