@@ -26,6 +26,7 @@ use Sys::Syslog qw/:standard :macros/;
 use POSIX qw/setsid/;
 use Socket;
 use IO::Socket::INET;
+use feature 'state';
 use feature 'signatures';
 no warnings qw(experimental::signatures);
 use Readonly;
@@ -217,7 +218,7 @@ else {
 	setlogmask(LOG_UPTO($DEBUG[$base_verbosity + $opts{v} - $opts{q}]));
 }
 
-my $sock = &openSocket();
+my $sock = openSocket();
 
 # lets make 'ps'/'netstat' look prettier
 $0 = basename($0);
@@ -241,9 +242,17 @@ if ($< == 0 || $> == 0) {
 # As long as we are running, the port and address will not change...
 Readonly my $ipxSrvNode => unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{p}));
 
+# %ignore are the bad guys.
+# Keys are IPs. Yes, we block entire IPs, not considering ports. A port switch
+# is easily done and filtering for it, too, would just keep actual attackers.
+# An IP switch is a lot more effort than just starting a new process.
+# Values are the epoch time stamps when that particular IP was sent into the
+# penalty box. Each IP remains there for at least the $cleanup_interval.
+
+# For details on %clients, see register function.
+
 my (%clients, %ignore);
 my $running = 1;
-my $cleanup_done_time = time;
 
 $SIG{INT}=$SIG{TERM}=\&sigTERM;
 $SIG{HUP}=\&sigHUP;
@@ -254,39 +263,18 @@ while ($running) {
     # not use up any CPU time, making it very light-weight.
 	my $srcpaddr = $sock->recv(my $payload, $max_ipx_payload_size, 0);
 
-	# if there has been a signal, this is undef
-	next unless $srcpaddr;
-
 	my $ts = time;
-    my $max_ts_without_cleanup = $cleanup_done_time + $cleanup_interval;
     # The blocking from above also implies, the cleanup never happens, unless
     # some package is received after exceeding the cleanup time.
     # This means, the client list may contain a number of zombies for a long
     # time, if nobody ever comes around and sends something to us after they
-    # expire.
-    if ($max_ts_without_cleanup < $ts) {
-		# to simplify the code (and to reduce possible spoofed
-		# disconnects), instead of listening for ICMP unreachables
-		# we simply timeout the connections which we would have to
-		# do anyway to mop up regularly disconnected users, as the
-		# clients do not inform the server when they go away.
-        my $cleanup_timeout = $ts - $opts{i};
-        syslog LOG_INFO,
-            "Cleanup time $max_ts_without_cleanup exceeded. Cleaning up...";
+    # expire. We do the cleanup also for non-paket cases, when there is only
+    # a signal coming in, too. But it will happen *after* the signal code was
+    # run.
+    do_cleanup($ts);
 
-        foreach my $client_identifier (keys %clients) {
-			next if $clients{$client_identifier}{ts} > $cleanup_timeout;
-
-			syslog LOG_NOTICE, "[$clients{$client_identifier}{ip}] idle timeout for $clients{$client_identifier}{node}";
-			delete $clients{$client_identifier};
-		}
-
-		# every interval we check what we can mop up
-		delete $ignore{$_}
-			for grep { $ignore{$_} + $cleanup_interval < $ts } keys %ignore;
-
-		$cleanup_done_time = $ts;
-	}
+    # if there has been a signal (so no actual communication), this is undef
+    next unless $srcpaddr;
 
 	my ($srcport, $srciaddr) = sockaddr_in $srcpaddr;
 	my $srcaddr = inet_ntoa $srciaddr;
@@ -294,74 +282,36 @@ while ($running) {
 	my $dgrm = &ipxDecode($srcaddr, $payload);
 	next unless defined $dgrm;
 
-    # Are they addressing us ourselves?
-    my $respond = (   $dgrm->{dst}{node} eq $ipxSrvNode
-                   || $dgrm->{dst}{node} eq $ipx_broadcast_node);
-	my $src_identifier = get_node_identifier($srcaddr, $srcport);
-	# registration packet
-	if (!$respond && isReg($dgrm)) {
-		# we *cannot* delete the previous registration otherwise
-		# this gives bad users a perfect opportunity to effectively
-		# kick others off.  The other, although unlikely, cause is
-		# if the client OS (or NAT) re-uses the same source port.
-		if (exists $clients{$src_identifier}) {
-			syslog LOG_WARNING, "[$srcaddr] re-registration, possibly spoofed DoS attempt";
-			next;
-		}
-
-		&register(\%clients, $ts, $srcaddr, $srcport);
+    # Are they addressing us ourselves? Then we have to respond.
+    my $need_to_respond = (   $dgrm->{dst}{node} eq $ipxSrvNode
+                           || $dgrm->{dst}{node} eq $ipx_broadcast_node);
+    my $src_identifier = get_host_identifier($srcaddr, $srcport);
+    # registration packet
+    if (!$need_to_respond && isReg($dgrm)) {
+        next if is_re_registration($src_identifier);
+        register(\%clients, $ts, $srcaddr, $srcport);
         # After registration we have to respond, too.
-		$respond = 1;
-	}
-	else {
-		unless (exists $clients{$src_identifier}) {
-            unless (defined $ignore{$srcaddr}) {
-                syslog LOG_WARNING, "[$srcaddr] packet(s) from unregistered source";
-            }
-			$ignore{$srcaddr} = $ts;
-			next;
-		}
+        $need_to_respond = 1;
+    }
+    else {
+        next if is_unregistered($src_identifier, $srcaddr, $ts);
+        next if rev_path_filtering_failed($dgrm, $src_identifier, $srcaddr, $ts);
 
-		# reverse path filtering
-		unless ($dgrm->{src}{node} eq $clients{$src_identifier}{node}) {
-            unless (defined $ignore{$srcaddr}) {
-                syslog LOG_ERR, "[$srcaddr] reverse path filtering failure(s)";
-            }
-			$ignore{$srcaddr} = $ts;
-			next;
-		}
+        $clients{$src_identifier}{ts} = $ts;
 
-		$clients{$src_identifier}{ts} = $ts;
+        syslog LOG_DEBUG,
+            "[$src_identifier] pkt $dgrm->{src}{node} > $dgrm->{dst}{node}";
 
-		syslog LOG_DEBUG, "[$srcaddr] pkt $dgrm->{src}{node} > $dgrm->{dst}{node}";
-
-		my $destination_identifiers = get_destination_identifiers($dgrm);
-
-		# N.B. we do not increment transport control as really
-		#	we are acting as a switch
-		# TODO handle errors (mtu?) rather than just report them
-		foreach my $dest_identifier (@$destination_identifiers) {
-			sock_send($payload => $dest_identifier);
-		}
-	}
-
-	next unless ($respond);
-
-    my $is_ping = (   $dgrm->{src}{sock} == $error_handling_packet
-                   && $dgrm->{dst}{sock} == $error_handling_packet);
-	if ($is_ping) {
-		# registration hack
-        unless ($dgrm->{src}{node} eq $fake_node) {
-            syslog LOG_INFO, "[$srcaddr] echo req from $dgrm->{src}{node}";
+        # This is actual payload communication, not just managing things.
+        # We are acting as a switch, sending directed messages only to the
+        # addressed recipient and broadcasts to anyone but the sender.
+        my $destination_identifiers = get_destination_identifiers($dgrm);
+        foreach my $dest_identifier (@$destination_identifiers) {
+            sock_send($payload => $dest_identifier);
         }
+    }
 
-		my $reply = pack 'nnCCH8H12nH8H12na*',
-			$ipx_checksum_const, $ipx_header_length,              $max_hop_count, $echo_protocol_packet,
-			$ipx_local_network,  $clients{$src_identifier}{node}, $error_handling_packet,
-			$ipx_local_network,  $ipxSrvNode,                     $error_handling_packet;
-
-		sock_send($reply => $src_identifier);
-	}
+    respond($dgrm, $src_identifier) if $need_to_respond;
 }
 
 $sock->close;
@@ -369,6 +319,83 @@ $sock->close;
 syslog LOG_NOTICE, 'exited';
 
 proper_exit($error_code{all_ok});
+
+sub do_cleanup ($ts) {
+    state $cleanup_done_time = time;
+    my $max_ts_without_cleanup = $cleanup_done_time + $cleanup_interval;
+    if ($max_ts_without_cleanup < $ts) {
+        # to simplify the code (and to reduce possible spoofed
+        # disconnects), instead of listening for ICMP unreachables
+        # we simply timeout the connections which we would have to
+        # do anyway to mop up regularly disconnected users, as the
+        # clients do not inform the server when they go away.
+        my $cleanup_timeout = $ts - $opts{i};
+        # We should make this a LOG_INFO after debugging...
+        syslog LOG_NOTICE,
+            "Cleanup time $max_ts_without_cleanup exceeded. Cleaning up...";
+
+        foreach my $client_identifier (keys %clients) {
+            next if $clients{$client_identifier}{ts} > $cleanup_timeout;
+
+            syslog LOG_NOTICE,
+                "[$client_identifier] idle timeout reached, removing it.";
+            delete $clients{$client_identifier};
+        }
+
+        # every interval we check what we can mop up
+        my @reinstated_ips =
+            (
+             grep { $ignore{$_} + $cleanup_interval < $ts }
+             keys %ignore
+            );
+        for my $reinstated_ip (@reinstated_ips) {
+            syslog LOG_NOTICE,
+                "[$reinstated_ip] Ignoring time exceeded, penalty is now" .
+                " lifted.";
+            delete $ignore{$_};
+        }
+        $cleanup_done_time = $ts;
+    }
+}
+
+sub is_re_registration ($src_identifier) {
+    # We *cannot* delete the previous registration. Nor can we ignore the guy.
+    # Otherwise this gives an attacker the perfect means to effectively kick
+    # other clients. The other (unlikely) cause is when the client OS (or NAT)
+    # re-uses the same source port. So essentially we do nothing, but log it.
+    if (exists $clients{$src_identifier}) {
+        syslog LOG_WARNING,
+            "[$src_identifier] re-registration, possibly spoofed DoS attempt";
+        return 1;
+    }
+    return 0;
+}
+
+sub is_unregistered ($src_identifier, $srcaddr, $ts) {
+    unless (exists $clients{$src_identifier}) {
+        unless (exists $ignore{$srcaddr}) {
+            syslog LOG_WARNING,
+                "[$src_identifier] packet(s) from unregistered source." .
+                " Ignoring $srcaddr for at least $cleanup_interval seconds.";
+        }
+        $ignore{$srcaddr} = $ts;
+        return 1;
+    }
+    return 0;
+}
+
+sub rev_path_filtering_failed ($dgrm, $src_identifier, $srcaddr, $ts) {
+    unless ($dgrm->{src}{node} eq $clients{$src_identifier}{node}) {
+        unless (defined $ignore{$srcaddr}) {
+            syslog LOG_ERR, "[$src_identifier] Reverse path filtering" .
+                " failure(s). Ignoring $srcaddr for at least" .
+                " $cleanup_interval seconds.";
+        }
+        $ignore{$srcaddr} = $ts;
+        return 1;
+    }
+    return 0;
+}
 
 sub get_destination_identifiers ($datagram) {
     my @client_identifiers = keys %clients;
@@ -379,6 +406,25 @@ sub get_destination_identifiers ($datagram) {
         # Rest goes specifically where it is supposed to go.
         : grep { $clients{$_}{node} eq $datagram->{dst}{node} } @client_identifiers;
     return \@destination_identifiers;
+}
+
+sub respond ($dgrm, $src_identifier) {
+    my $is_ping = (   $dgrm->{src}{sock} == $error_handling_packet
+                   && $dgrm->{dst}{sock} == $error_handling_packet);
+    if ($is_ping) {
+        # registration hack
+        my $is_registry_case = $dgrm->{src}{node} eq $fake_node;
+        unless ($is_registry_case) {
+            syslog LOG_INFO, "[$src_identifier] echo req from $dgrm->{src}{node}";
+        }
+
+        my $reply = pack 'nnCCH8H12nH8H12na*',
+            $ipx_checksum_const, $ipx_header_length,              $max_hop_count, $echo_protocol_packet,
+            $ipx_local_network,  $clients{$src_identifier}{node}, $error_handling_packet,
+            $ipx_local_network,  $ipxSrvNode,                     $error_handling_packet;
+
+        sock_send($reply => $src_identifier);
+    }
 }
 
 sub sigTERM {
@@ -485,28 +531,29 @@ sub ipxDecode ($srcaddr, $packet) {
 		return;
 	}
 	# HACK clause for the registration packets
-	if ($dgrm{src}{node} eq $dgrm{dst}{node} && !isReg(\%dgrm)) {
-		syslog LOG_ERR, "[$srcaddr] LAND attack packet";
-        # Troublemakers will be ignored for the $cleanup_interval
+    if ($dgrm{src}{node} eq $dgrm{dst}{node} && !isReg(\%dgrm)) {
+        syslog LOG_ERR, "[$srcaddr] LAND attack packet received." .
+            " Ignoring $srcaddr for at least $cleanup_interval seconds.";
+        # Troublemakers will be ignored
         $ignore{$srcaddr} = time;
-		return;
+        return;
 	}
 
 	return \%dgrm;
 }
 
-sub isReg ($d) {
+sub isReg ($datagram) {
 	# we ignore 'type' as it seems that:
 	#  * dosbox 0.72 => type = (not initialised - garbage)
 	#  * dosbox 0.73 => type = 0
-    return (   $d->{hop_count} == $max_hop_count
-            && $d->{len}       == $ipx_header_length
-            && $d->{src}{net}  eq $d->{dst}{net}
-            && $d->{src}{net}  eq $ipx_local_network
-            && $d->{src}{node} eq $d->{dst}{node}
-            && $d->{src}{node} eq $fake_node
-            && $d->{src}{sock} == $d->{dst}{sock}
-            && $d->{src}{sock} == $error_handling_packet);
+    return (   $datagram->{hop_count} == $max_hop_count
+            && $datagram->{len}       == $ipx_header_length
+            && $datagram->{src}{net}  eq $datagram->{dst}{net}
+            && $datagram->{src}{net}  eq $ipx_local_network
+            && $datagram->{src}{node} eq $datagram->{dst}{node}
+            && $datagram->{src}{node} eq $fake_node
+            && $datagram->{src}{sock} == $datagram->{dst}{sock}
+            && $datagram->{src}{sock} == $error_handling_packet);
 }
 
 sub register ($clients, $ts, $srcaddr, $srcport) {
@@ -523,7 +570,7 @@ sub register ($clients, $ts, $srcaddr, $srcport) {
 	#	If we end up doing this, it probably is safe to pay
 	#	attention to those 'ICMP unreachable' messages that come
 	#	back when we have a disconnected client
-	my $src_identifier = get_node_identifier($srcaddr, $srcport);
+    my $src_identifier = get_host_identifier($srcaddr, $srcport);
 	$clients->{$src_identifier} = {
         ip    => $srcaddr, # e.g. 192.168.0.2
         port  => $srcport, # e.g. 58619
@@ -538,7 +585,7 @@ sub register ($clients, $ts, $srcaddr, $srcport) {
 # For consistency reasons use this for creating an identifier. Maybe we will
 # change that format of identifiers in the future. If so, you only need to alter
 # this particular function. Not all occurences of identifiers...
-sub get_node_identifier ($addr, $port) {
+sub get_host_identifier ($addr, $port) {
     return "$addr:$port";
 }
 
