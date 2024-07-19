@@ -172,7 +172,6 @@ GetOptions(
     'n|no-fork' => \$opts{n},
 ) || pod2usage($error_code{cli_parameter_fault});
 
-
 unless ($opts{l} >= 0 && $opts{l} < 8) {
     proper_exit($error_code{cli_parameter_fault},
                 'Invalid SYSLOG facility value (0 <= n < 8)');
@@ -641,6 +640,10 @@ ipxserver [options]
 
 pkill -HUP ipxserver
 
+=item show details about connected clients
+
+pkill -USR1 ipxserver
+
 =item shutdown
 
 pkill ipxserver
@@ -657,7 +660,7 @@ Everything went fine, normal operations until normal shutdown.
 
 =item 1
 
-Could not open socket. Usually that means either there is not network interface
+Could not open socket. Usually that means either there is no network interface
 with IPv4 active or the UDP port meant to be used is already used by another
 process.
 
