@@ -261,7 +261,7 @@ $SIG{USR1}=\&sigUSR1;
 while ($running) {
     # This is blocking. So unless we have traffic, this service will basically
     # not use up any CPU time, making it very light-weight.
-	my $srcpaddr = $sock->recv(my $payload, $max_ipx_payload_size, 0);
+	my $srcpaddr = $sock->recv(my $packet, $max_ipx_payload_size, 0);
 
 	my $ts = time;
     # The blocking from above also implies, the cleanup never happens, unless
@@ -279,7 +279,7 @@ while ($running) {
 	my ($srcport, $srciaddr) = sockaddr_in $srcpaddr;
 	my $srcaddr = inet_ntoa $srciaddr;
 
-	my $dgrm = &ipxDecode($srcaddr, $payload);
+	my $dgrm = ipxDecode($srcaddr, $packet);
 	next unless defined $dgrm;
 
     # Are they addressing us ourselves? Then we have to respond.
@@ -297,7 +297,9 @@ while ($running) {
         next if is_unregistered($src_identifier, $srcaddr, $ts);
         next if rev_path_filtering_failed($dgrm, $src_identifier, $srcaddr, $ts);
 
-        $clients{$src_identifier}{ts} = $ts;
+        $clients{$src_identifier}{ts}    = $ts;
+        $clients{$src_identifier}{ts_c}  = $ts;
+        $clients{$src_identifier}{sent} += length($packet);
 
         syslog LOG_DEBUG,
             "[$src_identifier] pkt $dgrm->{src}{node} > $dgrm->{dst}{node}";
@@ -307,7 +309,7 @@ while ($running) {
         # addressed recipient and broadcasts to anyone but the sender.
         my $destination_identifiers = get_destination_identifiers($dgrm);
         foreach my $dest_identifier (@$destination_identifiers) {
-            sock_send($payload => $dest_identifier);
+            sock_send($packet => $dest_identifier);
         }
     }
 
@@ -336,9 +338,11 @@ sub do_cleanup ($ts) {
 
         foreach my $client_identifier (keys %clients) {
             next if $clients{$client_identifier}{ts} > $cleanup_timeout;
+            my $data_rate = get_data_rates($client_identifier);
 
             syslog LOG_NOTICE,
-                "[$client_identifier] idle timeout reached, removing it.";
+                "[$client_identifier] idle timeout reached, removing it"
+                . " ($data_rate).";
             delete $clients{$client_identifier};
         }
 
@@ -448,7 +452,9 @@ sub sigUSR1 {
     my @client_identifiers = sort keys %clients;
     my $counter = @client_identifiers;
     foreach my $identifier (@client_identifiers) {
-        syslog LOG_NOTICE, "$identifier is considered connected.";
+        my $data_rate = get_data_rates($identifier);
+        syslog LOG_NOTICE,
+            "$identifier is considered connected ($data_rate).";
     }
     unless (@client_identifiers) {
         syslog LOG_NOTICE, "Currently no clients connected.";
@@ -480,16 +486,20 @@ sub openSocket () {
 	return $sock;
 }
 
-sub sock_send ($payload, $recipient_identifier) {
+sub sock_send ($packet, $recipient_identifier) {
     # TODO handle errors (mtu?) rather than just report them
-    my $sent_count = $sock->send($payload,
+    my $sent_count = $sock->send($packet,
                                  MSG_DONTWAIT, # = Non-blocking
                                  $clients{$recipient_identifier}{paddr});
-    unless (defined $sent_count) {
+    if (defined $sent_count) {
+        $clients{$recipient_identifier}{received} += $sent_count;
+        $clients{$recipient_identifier}{ts_c}      = time;
+    }
+    else {
         syslog LOG_ERR, "[$recipient_identifier] unable to send: $@";
         return;
     }
-    unless ($sent_count == length($payload)) {
+    unless ($sent_count == length($packet)) {
         syslog LOG_ERR,
             "[$recipient_identifier] unable to send complete payload.";
     }
@@ -571,12 +581,17 @@ sub register ($clients, $ts, $srcaddr, $srcport) {
 	#	attention to those 'ICMP unreachable' messages that come
 	#	back when we have a disconnected client
     my $src_identifier = get_host_identifier($srcaddr, $srcport);
+    # All time stamps are epoch times.
 	$clients->{$src_identifier} = {
-        ip    => $srcaddr, # e.g. 192.168.0.2
-        port  => $srcport, # e.g. 58619
-        node  => $node,    # e.g. c0a80002e4fb
-        paddr => $paddr,   # Binary represantation of port and address
-        ts    => $ts,      # epoch Time when this client has sent the last time
+        ip       => $srcaddr, # e.g. 192.168.0.2
+        port     => $srcport, # e.g. 58619
+        node     => $node,    # e.g. c0a80002e4fb
+        paddr    => $paddr,   # Binary representation of port and address
+        ts       => $ts,      # Last time this client has sent data
+        ts_f     => $ts,      # First time this client has communicated
+        ts_c     => $ts,      # Last time this client has communicated
+        sent     => 0,        # Number of bytes this client as sent so far.
+        received => 0,        # Number of bytes this client has received so far.
 	};
 
 	syslog LOG_NOTICE, "[$srcaddr] registered client $node";
@@ -587,6 +602,31 @@ sub register ($clients, $ts, $srcaddr, $srcport) {
 # this particular function. Not all occurences of identifiers...
 sub get_host_identifier ($addr, $port) {
     return "$addr:$port";
+}
+
+sub get_data_rates ($identifier) {
+    my $sent = $clients{$identifier}{sent};
+    my $received = $clients{$identifier}{received};
+    my $duration =
+        ($clients{$identifier}{ts_c} - $clients{$identifier}{ts_f}) || 1;
+    my $sent_rate = $sent / $duration;
+    my $received_rate = $received / $duration;
+    $sent      =      number_format($sent)          . 'byte';
+    $received  =      number_format($received)      . 'byte';
+    $sent_rate =      number_format($sent_rate)     . 'byte/sec.';
+    $received_rate  = number_format($received_rate) . 'byte/sec.';
+    return "sent: $sent, $sent_rate; received: $received, $received_rate";
+}
+
+sub number_format ($number) {
+    state $prefixes = [q(), qw(k M G T)];
+    my $index = 0;
+    while ($number >= 1000) {
+        $number /= 1000;
+        $index++;
+    }
+    $number = int($number * 10 + 0.5) / 10;
+    return "$number $prefixes->[$index]";
 }
 
 __END__
