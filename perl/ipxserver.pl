@@ -31,10 +31,9 @@ use feature 'signatures';
 no warnings qw(experimental::signatures);
 use Readonly;
 
-#use Data::Dumper;
-
-my $VERSION = '20100124';
-
+##### Bunch of constants #####
+Readonly my $VERSION => '20240720';
+# This whole die paradigm sucks. Use proper exit codes!
 Readonly my %error_code =>
     (
      all_ok              => 0,
@@ -42,20 +41,8 @@ Readonly my %error_code =>
      cli_parameter_fault => 2,
      fork_failure        => 3,
     );
-
-sub proper_exit ($error_code, $message = undef) {
-    if (defined $message) {
-        if ($error_code{all_ok} != $error_code) {
-            print STDERR "$message\n";
-        }
-        else {
-            print STDOUT "$message\n";
-        }
-    }
-    exit $error_code;
-}
-
-Readonly my @DEBUG => (
+# Those are the facilities for the syslog:
+Readonly my @log_levels => (
     LOG_EMERG,   # system is unusable
     LOG_ALERT,   # action must be taken immediately
     LOG_CRIT,    # critical conditions
@@ -65,11 +52,14 @@ Readonly my @DEBUG => (
     LOG_INFO,    # informational message
     LOG_DEBUG    # verbose-level message
 );
-
+# If nothing else is set, we start out with LOG_NOTICE:
 Readonly my $base_verbosity => 5;
+# Once every 10 minutes it's time to drop zombies and reinstate ignored hosts.
 Readonly my $cleanup_interval => 600;
-
-#This is a fixed definition by the IPX protocol:
+# We could use this at some point to tie the server to a specific interface.
+# We listen on any network card:
+Readonly my $bind_address => '0.0.0.0';
+# This is a fixed definition by the IPX protocol:
 Readonly my $ipx_header_length => 30;
 # Everyone is addressed, meaning, even we will respond to those calls:
 Readonly my $ipx_broadcast_node => 'ffffffffffff';
@@ -144,15 +134,15 @@ STDERR.
 
 =cut
 
-my $port = getservbyname('ipx', 'udp') || 213;
+my $default_port = getservbyname('ipx', 'udp') || 213;
 my %opts = (
-	v	=> 0,
-	q	=> 0,
+	v	=> 0,             # Verbosity level
+	q	=> 0,             # Quiet level
 
-	l	=> 0,
-	p	=> $port,
-	u	=> 'nobody',
-	i	=> 1800,
+	l	=> 0,             # Syslog facility level
+	p	=> $default_port, # UDP port to be used for incoming connections
+	u	=> 'nobody',      # User to drop to, once the socket is created
+	i	=> 1800,          # Max duration after which an idle client is dropped
 );
 GetOptions(
     'h|help'    => sub { pod2usage(-exitval => $error_code{all_ok}) },
@@ -172,74 +162,29 @@ GetOptions(
     'n|no-fork' => \$opts{n},
 ) || pod2usage($error_code{cli_parameter_fault});
 
-unless ($opts{l} >= 0 && $opts{l} < 8) {
-    proper_exit($error_code{cli_parameter_fault},
-                'Invalid SYSLOG facility value (0 <= n < 8)');
-}
-unless ($opts{p} > 0 && $opts{p} < 65536) {
-    proper_exit($error_code{cli_parameter_fault},
-                'Invalid port number to listen on (0 < n < 65536)');
-}
+perform_parameter_sanity_check();
 
+# Lets make 'ps', 'netstat' and our own logs look prettier:
+$0 = basename($0);
 if (defined $opts{n}) {
-	openlog(basename($0), 'ndelay|pid|perror', "local$opts{l}");
+    openlog($0, 'ndelay|pid|perror', "local$opts{l}");
 }
 else {
-	# perlfaq8 - How do I fork a daemon process?
-	my $sid = setsid;
-	chdir '/';
-
-	open STDIN,  '+>/dev/null';
-	open STDOUT, '+>&STDIN';
-	open STDERR, '+>&STDIN';
-
-	my $pid = fork;
-    unless (defined $pid) {
-        proper_exit($error_code{fork_failure},
-                    "Unable to fork() as daemon: $!");
-    }
-    if ($pid != 0) {
-        proper_exit($error_code{all_ok});
-    }
-
-	openlog(basename($0), 'ndelay|pid', "local$opts{l}");
-
-	syslog LOG_NOTICE, 'started';
+    fork_daemon();
+    openlog($0, 'ndelay|pid', "local$opts{l}");
+    syslog LOG_NOTICE, 'started';
 }
 
-if ($base_verbosity + $opts{v} - $opts{q} >= scalar(@DEBUG)) {
-	setlogmask(LOG_UPTO(LOG_DEBUG));
-}
-elsif ($base_verbosity + $opts{v} - $opts{q} < 0) {
-	setlogmask(LOG_UPTO(LOG_EMERG));
-}
-else {
-	setlogmask(LOG_UPTO($DEBUG[$base_verbosity + $opts{v} - $opts{q}]));
-}
+set_syslog_verbosity_level();
 
 my $sock = openSocket();
-
-# lets make 'ps'/'netstat' look prettier
-$0 = basename($0);
-
 # After creating the socket, we no longer need to run as root
-if ($< == 0 || $> == 0) {
-	$< = $> = getpwnam $opts{u};
-	syslog LOG_WARNING, "Unable to drop root uid priv: $!"
-		if ($!);
-}
-#if ($( == 0 || $) == 0) {
-#	$( = $) = getgrnam $opts{u};
-#	syslog LOG_WARNING, "unable to drop root gid priv: $!"
-#		if ($!);
-#}
+drop_root_privileges();
 
-# the server address does not really matter, so we pick 0.0.0.0
-# as it is impossible that anything else would use this
-# --> Actually it means listening on all network interfaces with IPv4...
-# We could use this at some point to tie the server to a specific interface.
 # As long as we are running, the port and address will not change...
-Readonly my $ipxSrvNode => unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{p}));
+Readonly my $ipxSrvNode => unpack('H12',
+                                  inet_aton($bind_address) . pack('n',
+                                                                  $opts{p}));
 
 # %ignore are the bad guys.
 # Keys are IPs. Yes, we block entire IPs, not considering ports. A port switch
@@ -253,9 +198,7 @@ Readonly my $ipxSrvNode => unpack('H12', inet_aton('0.0.0.0') . pack('n', $opts{
 my (%clients, %ignore);
 my $running = 1;
 
-$SIG{INT}=$SIG{TERM}=\&sigTERM;
-$SIG{HUP}=\&sigHUP;
-$SIG{USR1}=\&sigUSR1;
+register_signal_handlers();
 
 while ($running) {
     # This is blocking. So unless we have traffic, this service will basically
@@ -320,6 +263,65 @@ $sock->close;
 syslog LOG_NOTICE, 'exited';
 
 proper_exit($error_code{all_ok});
+
+sub perform_parameter_sanity_check () {
+    unless ($opts{l} >= 0 && $opts{l} < 8) {
+        proper_exit($error_code{cli_parameter_fault},
+                    'Invalid SYSLOG facility value (0 <= n < 8)');
+    }
+    unless ($opts{p} > 0 && $opts{p} < 65536) {
+        proper_exit($error_code{cli_parameter_fault},
+                    'Invalid port number to listen on (0 < n < 65536)');
+    }
+}
+
+sub set_syslog_verbosity_level () {
+    # Verbosity and Quiet combined cancel each other out.
+    my $derived_log_level = $base_verbosity + $opts{v} - $opts{q};
+    # But that can lead to nonsense...
+    my $actual_log_level;
+    if ($derived_log_level >= scalar @log_levels) {
+        $actual_log_level = -1;
+    }
+    elsif ($derived_log_level < 0) {
+        $actual_log_level = 0;
+    }
+    else {
+        $actual_log_level = $derived_log_level;
+    }
+    setlogmask(LOG_UPTO($log_levels[$actual_log_level]));
+}
+
+sub drop_root_privileges () {
+    if ($< == 0 || $> == 0) {
+        $< = $> = getpwnam $opts{u};
+        syslog LOG_WARNING, "Unable to drop root uid priv: $!" if ($!);
+    }
+    #if ($( == 0 || $) == 0) {
+    #	$( = $) = getgrnam $opts{u};
+    #	syslog LOG_WARNING, "unable to drop root gid priv: $!"
+    #		if ($!);
+    #}
+}
+
+sub fork_daemon () {
+	# perlfaq8 - How do I fork a daemon process?
+	my $sid = setsid;
+	chdir '/';
+
+	open STDIN,  '+>/dev/null';
+	open STDOUT, '+>&STDIN';
+	open STDERR, '+>&STDIN';
+
+	my $pid = fork;
+    unless (defined $pid) {
+        proper_exit($error_code{fork_failure},
+                    "Unable to fork() as daemon: $!");
+    }
+    if ($pid != 0) {
+        proper_exit($error_code{all_ok});
+    }
+}
 
 sub do_cleanup ($ts) {
     state $cleanup_done_time = time;
@@ -430,6 +432,12 @@ sub respond ($dgrm, $src_identifier) {
     }
 }
 
+sub register_signal_handlers () {
+    $SIG{INT}=$SIG{TERM}=\&sigTERM;
+    $SIG{HUP}=\&sigHUP;
+    $SIG{USR1}=\&sigUSR1;
+}
+
 sub sigTERM {
 	my $signal = shift;
 
@@ -438,6 +446,7 @@ sub sigTERM {
 		$running = 0;
 	}
 };
+
 sub sigHUP {
 	my $signal = shift;
 
@@ -626,6 +635,18 @@ sub number_format ($number) {
     }
     $number = int($number * 10 + 0.5) / 10;
     return "$number $prefixes->[$index]";
+}
+
+sub proper_exit ($error_code, $message = undef) {
+    if (defined $message) {
+        if ($error_code{all_ok} != $error_code) {
+            print STDERR "$message\n";
+        }
+        else {
+            print STDOUT "$message\n";
+        }
+    }
+    exit $error_code;
 }
 
 __END__
