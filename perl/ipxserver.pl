@@ -14,6 +14,10 @@ installed.  The main advantages being that it runs standalone
 and if run as root it can listen on port 213/udp (the IANA
 assigned port for IPX over IP tunnelling).
 
+Connects, disconnects and important messages are always logged to
+/var/log/ipxserver.log. Besides that, syslog is also filled according to the set
+log level.
+
 =cut
 
 use strict;
@@ -30,16 +34,20 @@ use feature 'state';
 use feature 'signatures';
 no warnings qw(experimental::signatures);
 use Readonly;
+# For auto flushing the log file.
+use IO::Handle;
 
 ##### Bunch of constants #####
-Readonly my $VERSION => '20240720';
+Readonly my $VERSION => '20240811';
 # This whole die paradigm sucks. Use proper exit codes!
 Readonly my %error_code =>
     (
-     all_ok              => 0,
-     socket_fault        => 1,
-     cli_parameter_fault => 2,
-     fork_failure        => 3,
+     all_ok               => 0,
+     socket_fault         => 1,
+     cli_parameter_fault  => 2,
+     fork_failure         => 3,
+     cannot_open_log_file => 4,
+     cannot_write_to_log  => 5,
     );
 # Those are the facilities for the syslog:
 Readonly my @log_levels => (
@@ -166,6 +174,10 @@ perform_parameter_sanity_check();
 
 # Lets make 'ps', 'netstat' and our own logs look prettier:
 $0 = basename($0);
+
+Readonly my $log_file_name => '/var/log/ipxserver.log';
+open_log_file();
+
 if (defined $opts{n}) {
     openlog($0, 'ndelay|pid|perror', "local$opts{l}");
 }
@@ -173,12 +185,16 @@ else {
     fork_daemon();
     openlog($0, 'ndelay|pid', "local$opts{l}");
     syslog LOG_NOTICE, 'started';
+    filelog('##### Started #####');
+    filelog("Clean up interval: $cleanup_interval s, max idle duration: $opts{i} s");
 }
 
 set_syslog_verbosity_level();
 
 my $sock = openSocket();
-# After creating the socket, we no longer need to run as root
+
+# After creating the socket and opening the log file,
+# we no longer need to run as root
 drop_root_privileges();
 
 # As long as we are running, the port and address will not change...
@@ -195,7 +211,7 @@ Readonly my $ipxSrvNode => unpack('H12',
 
 # For details on %clients, see register function.
 
-my (%clients, %ignore);
+my (%clients, %ignore, $log_file_handle);
 my $running = 1;
 
 register_signal_handlers();
@@ -261,7 +277,9 @@ while ($running) {
 $sock->close;
 
 syslog LOG_NOTICE, 'exited';
+filelog('##### Exited Regularly #####');
 
+# This also closes a still open log file:
 proper_exit($error_code{all_ok});
 
 sub perform_parameter_sanity_check () {
@@ -340,10 +358,11 @@ sub do_cleanup ($ts) {
         foreach my $client_identifier (keys %clients) {
             next if $clients{$client_identifier}{ts} > $cleanup_timeout;
             my $data_rate = get_data_rates($client_identifier);
+            my $log_msg = "[$client_identifier] idle timeout reached, removing"
+                . " it ($data_rate).";
 
-            syslog LOG_NOTICE,
-                "[$client_identifier] idle timeout reached, removing it"
-                . " ($data_rate).";
+            syslog LOG_NOTICE, $log_msg;
+            filelog($log_msg);
             delete $clients{$client_identifier};
         }
 
@@ -354,9 +373,10 @@ sub do_cleanup ($ts) {
              keys %ignore
             );
         for my $reinstated_ip (@reinstated_ips) {
-            syslog LOG_NOTICE,
-                "[$reinstated_ip] Ignoring time exceeded, penalty is now" .
-                " lifted.";
+            my $msg = "[$reinstated_ip] Ignoring time exceeded, penalty is now"
+                . " lifted.";
+            syslog LOG_NOTICE, $msg;
+            filelog($msg);
             delete $ignore{$_};
         }
         $cleanup_done_time = $ts;
@@ -369,8 +389,10 @@ sub is_re_registration ($src_identifier) {
     # other clients. The other (unlikely) cause is when the client OS (or NAT)
     # re-uses the same source port. So essentially we do nothing, but log it.
     if (exists $clients{$src_identifier}) {
-        syslog LOG_WARNING,
+        my $msg =
             "[$src_identifier] re-registration, possibly spoofed DoS attempt";
+        syslog LOG_WARNING, $msg;
+        filelog($msg);
         return 1;
     }
     return 0;
@@ -379,9 +401,11 @@ sub is_re_registration ($src_identifier) {
 sub is_unregistered ($src_identifier, $srcaddr, $ts) {
     unless (exists $clients{$src_identifier}) {
         unless (exists $ignore{$srcaddr}) {
-            syslog LOG_WARNING,
+            my $msg =
                 "[$src_identifier] packet(s) from unregistered source." .
                 " Ignoring $srcaddr for at least $cleanup_interval seconds.";
+            syslog LOG_WARNING, $msg;
+            filelog($msg);
         }
         $ignore{$srcaddr} = $ts;
         return 1;
@@ -392,9 +416,10 @@ sub is_unregistered ($src_identifier, $srcaddr, $ts) {
 sub rev_path_filtering_failed ($dgrm, $src_identifier, $srcaddr, $ts) {
     unless ($dgrm->{src}{node} eq $clients{$src_identifier}{node}) {
         unless (defined $ignore{$srcaddr}) {
-            syslog LOG_ERR, "[$src_identifier] Reverse path filtering" .
-                " failure(s). Ignoring $srcaddr for at least" .
-                " $cleanup_interval seconds.";
+            my $msg = "[$src_identifier] Reverse path filtering failure(s)."
+                . " Ignoring $srcaddr for at least $cleanup_interval seconds.";
+            syslog LOG_ERR, $msg;
+            filelog($msg);
         }
         $ignore{$srcaddr} = $ts;
         return 1;
@@ -442,21 +467,26 @@ sub sigTERM {
 	my $signal = shift;
 
 	if ($running) {
-		syslog LOG_NOTICE, "caught SIG$signal...shutting down";
+        my $msg = "Caught SIG$signal...shutting down";
+        syslog LOG_NOTICE, $msg;
+        filelog($msg);
 		$running = 0;
 	}
 };
 
 sub sigHUP {
-	my $signal = shift;
-
-	syslog LOG_NOTICE, "caught SIGHUP, disconnecting all clients";
-	%clients = ();
+    my $signal = shift;
+    my $msg = "Caught SIGHUP, disconnecting all clients";
+    syslog LOG_NOTICE, $msg;
+    filelog($msg);
+    %clients = ();
 }
 
 sub sigUSR1 {
-	my $signal = shift;
-	syslog LOG_NOTICE, "caught SIGUSR1, listing all clients currently connected.";
+    my $signal = shift;
+    my $msg = "Caught SIGUSR1, listing all clients currently connected.";
+    syslog LOG_NOTICE, $msg;
+    filelog($msg);
     my @client_identifiers = sort keys %clients;
     my $counter = @client_identifiers;
     foreach my $identifier (@client_identifiers) {
@@ -471,8 +501,10 @@ sub sigUSR1 {
 
 sub openSocket () {
 	my %args = (
-		LocalPort	=> $opts{p},
-		Proto		=> 'udp'
+        LocalPort	=> $opts{p},
+		Proto		=> 'udp',
+        # This does nothing, so don't even try:
+        # Timeout   => $cleanup_interval,
 	);
 
     # as dosbox is not v6 enabled... :-/
@@ -487,6 +519,7 @@ sub openSocket () {
     unless (defined $sock) {
         my $error_message = "Could not open UDP socket: $!";
         syslog LOG_CRIT, $error_message;
+        filelog($error_message);
         proper_exit($error_code{socket_fault},
                     $error_message);
     }
@@ -504,12 +537,15 @@ sub sock_send ($packet, $recipient_identifier) {
         $clients{$recipient_identifier}{ts_c}      = time;
     }
     else {
-        syslog LOG_ERR, "[$recipient_identifier] unable to send: $@";
+        my $msg = "[$recipient_identifier] unable to send: $@";
+        syslog LOG_ERR, $msg;
+        filelog($msg);
         return;
     }
     unless ($sent_count == length($packet)) {
-        syslog LOG_ERR,
-            "[$recipient_identifier] unable to send complete payload.";
+        my $msg = "[$recipient_identifier] unable to send complete payload.";
+        syslog LOG_ERR, $msg;
+        filelog($msg);
     }
 }
 
@@ -550,8 +586,10 @@ sub ipxDecode ($srcaddr, $packet) {
 	}
 	# HACK clause for the registration packets
     if ($dgrm{src}{node} eq $dgrm{dst}{node} && !isReg(\%dgrm)) {
-        syslog LOG_ERR, "[$srcaddr] LAND attack packet received." .
-            " Ignoring $srcaddr for at least $cleanup_interval seconds.";
+        my $msg = "[$srcaddr] LAND attack packet received. Ignoring $srcaddr"
+            . " for at least $cleanup_interval seconds.";
+        syslog LOG_ERR, $msg;
+        filelog($msg);
         # Troublemakers will be ignored
         $ignore{$srcaddr} = time;
         return;
@@ -601,8 +639,35 @@ sub register ($clients, $ts, $srcaddr, $srcport) {
         sent     => 0,        # Number of bytes this client as sent so far.
         received => 0,        # Number of bytes this client has received so far.
 	};
+    my $msg = "[$srcaddr] registered client $node";
+    syslog LOG_NOTICE, $msg;
+    filelog($msg);
+}
 
-	syslog LOG_NOTICE, "[$srcaddr] registered client $node";
+sub filelog ($message) {
+    return unless defined $log_file_handle;
+    my $timestamp = time;
+    my $worked = say $log_file_handle "$timestamp: $message";
+    unless ($worked) {
+        proper_exit($error_code{cannot_write_to_log},
+                    "Could not write to log file $log_file_name.")
+    }
+}
+
+sub open_log_file () {
+    my $worked = open($log_file_handle, '>>', $log_file_name);
+    unless ($worked) {
+        proper_exit($error_code{cannot_open_log_file},
+                    "Could not open log file $log_file_name.")
+    }
+    # We don't want to lose a log file line...
+    $log_file_handle->autoflush;
+}
+
+sub close_log_file () {
+    return unless defined $log_file_handle;
+    close $log_file_handle;
+    undef $log_file_handle;
 }
 
 # For consistency reasons use this for creating an identifier. Maybe we will
@@ -640,12 +705,17 @@ sub number_format ($number) {
 sub proper_exit ($error_code, $message = undef) {
     if (defined $message) {
         if ($error_code{all_ok} != $error_code) {
+            unless ($error_code == $error_code{cannot_write_to_log}) {
+                filelog("##### Premature ending: $message #####");
+            }
             print STDERR "$message\n";
         }
         else {
             print STDOUT "$message\n";
         }
     }
+    # All log messages should already be written. We can wrap it up here.
+    close_log_file();
     exit $error_code;
 }
 
@@ -661,7 +731,7 @@ ipxserver [options]
 
 pkill -HUP ipxserver
 
-=item show details about connected clients
+=item show details about connected clients in syslog
 
 pkill -USR1 ipxserver
 
@@ -683,7 +753,7 @@ Everything went fine, normal operations until normal shutdown.
 
 Could not open socket. Usually that means either there is no network interface
 with IPv4 active or the UDP port meant to be used is already used by another
-process.
+process. It could also mean, the timeout could not be set properly.
 
 =item 2
 
@@ -694,6 +764,14 @@ somehow wrong/unusable.
 
 Fork failure: The child process could not be spawned. Usually that means
 something external is wrong, e.g. not enough RAM left to duplicate the process.
+
+=item 4
+
+The log file could not be opened.
+
+=item 5
+
+A log file line could not be written.
 
 =back
 
