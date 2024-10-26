@@ -186,6 +186,7 @@ else {
     openlog($0, 'ndelay|pid', "local$opts{l}");
     syslog LOG_NOTICE, 'started';
     filelog('##### Started #####');
+    filelog("Version: $VERSION");
     filelog("Clean up interval: $cleanup_interval s, max idle duration: $opts{i} s");
 }
 
@@ -586,10 +587,13 @@ sub ipxDecode ($srcaddr, $packet) {
 	}
 	# HACK clause for the registration packets
     if ($dgrm{src}{node} eq $dgrm{dst}{node} && !isReg(\%dgrm)) {
-        my $msg = "[$srcaddr] LAND attack packet received. Ignoring $srcaddr"
-            . " for at least $cleanup_interval seconds.";
-        syslog LOG_ERR, $msg;
-        filelog($msg);
+        # Otherwise the guy will spam the logs...
+        unless (exists $ignore{$srcaddr}) {
+            my $msg = "[$srcaddr] LAND attack packet received. Ignoring"
+                . " $srcaddr for at least $cleanup_interval seconds.";
+            syslog LOG_ERR, $msg;
+            filelog($msg);
+        }
         # Troublemakers will be ignored
         $ignore{$srcaddr} = time;
         return;
