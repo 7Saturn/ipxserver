@@ -1,0 +1,91 @@
+{
+    // Build tasks for the C# port (csharp/). Run them with
+    //   Terminal > Run Task...        (all tasks)
+    //   Ctrl+Shift+B                  (the default build task "build")
+    // Every task simply calls the dotnet command line, so each of them can be
+    // run by hand in a terminal just the same. See csharp/README.md.
+    "version": "2.0.0",
+    "options": {
+        "cwd": "${workspaceFolder}/csharp"
+    },
+    "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+    },
+    "tasks": [
+        {
+            // Debug build of server and tests. Used by the debugger (F5), too.
+            "label": "build",
+            "type": "process",
+            "command": "dotnet",
+            "args": ["build", "ipxserver.slnx"],
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "test",
+            "type": "process",
+            "command": "dotnet",
+            "args": ["run", "--project", "tests/ipxserver.Tests"],
+            "group": { "kind": "test", "isDefault": true },
+            "problemMatcher": "$msCompile"
+        },
+        {
+            // Starts the server in the terminal on unprivileged ports
+            // (IPv4: 2130, IPv6: 2131). Stop it with Ctrl+C.
+            "label": "run",
+            "type": "process",
+            "command": "dotnet",
+            "args": [
+                "run", "--project", "src/ipxserver", "--",
+                "-n", "-v", "-v", "-p", "2130", "-P", "2131",
+                "-L", "ipxserver-debug.log"
+            ],
+            "isBackground": true,
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "clean",
+            "type": "process",
+            "command": "dotnet",
+            "args": ["clean", "ipxserver.slnx"],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            // Release binary for 64 bit Windows -> csharp/dist/win-x64/ipxserver.exe
+            "label": "publish win-x64",
+            "type": "process",
+            "command": "dotnet",
+            "args": ["publish", "src/ipxserver", "-c", "Release", "-r", "win-x64", "-o", "dist/win-x64"],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            // Release binary for 64 bit Linux (PC) -> csharp/dist/linux-x64/ipxserver
+            "label": "publish linux-x64",
+            "type": "process",
+            "command": "dotnet",
+            "args": ["publish", "src/ipxserver", "-c", "Release", "-r", "linux-x64", "-o", "dist/linux-x64"],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            // Release binary for 64 bit ARM Linux (e.g. Raspberry Pi OS 64 bit)
+            "label": "publish linux-arm64",
+            "type": "process",
+            "command": "dotnet",
+            "args": ["publish", "src/ipxserver", "-c", "Release", "-r", "linux-arm64", "-o", "dist/linux-arm64"],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            // Tests + release binaries for all platforms -> csharp/dist/
+            "label": "publish all",
+            "type": "shell",
+            "command": "./build.sh",
+            "windows": {
+                "command": "powershell",
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "build.ps1"]
+            },
+            "problemMatcher": "$msCompile"
+        }
+    ]
+}

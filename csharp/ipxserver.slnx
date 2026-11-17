@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ipxserver/ipxserver.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ipxserver.Tests/ipxserver.Tests.csproj" />
+  </Folder>
+</Solution>

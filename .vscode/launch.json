@@ -1,0 +1,24 @@
+{
+    // F5 builds the project (task "build") and starts the server in the
+    // debugger, on unprivileged ports (IPv4: 2130, IPv6: 2131) so no special
+    // rights are needed. Requires the extension "C#" (ms-dotnettools.csharp).
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "ipxserver (debug)",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/csharp/src/ipxserver/bin/Debug/net10.0/ipxserver.dll",
+            "args": [
+                "-n", "-v", "-v",
+                "-p", "2130",
+                "-P", "2131",
+                "-L", "${workspaceFolder}/csharp/ipxserver-debug.log"
+            ],
+            "cwd": "${workspaceFolder}/csharp",
+            "console": "integratedTerminal",
+            "stopAtEntry": false
+        }
+    ]
+}

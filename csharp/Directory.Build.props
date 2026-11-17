@@ -1,0 +1,21 @@
+<Project>
+  <!-- Settings shared by all projects below csharp/ (server and tests). -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- NU1900: the NuGet vulnerability database could not be reached. That
+         must not break builds on machines without internet access. -->
+    <WarningsNotAsErrors>NU1900</WarningsNotAsErrors>
+    <!-- The server needs no culture data. This keeps the binaries small and
+         removes the dependency on libicu under Linux. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Version of the C# port. The release workflow overrides this with the
+         version taken from the git tag (-p:Version=x.y.z). -->
+    <Version>2.0.0</Version>
+    <!-- Do not append "+<git commit hash>" to the version string. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+</Project>

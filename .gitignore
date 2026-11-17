@@ -1,0 +1,8 @@
+# Build output of the C# port
+bin/
+obj/
+/csharp/dist/
+*.user
+.vs/
+# Log file written when starting the server from the VS Code debugger
+/csharp/ipxserver-debug.log

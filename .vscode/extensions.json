@@ -1,0 +1,6 @@
+{
+    // Visual Studio Code offers to install these when the folder is opened.
+    "recommendations": [
+        "ms-dotnettools.csharp"
+    ]
+}

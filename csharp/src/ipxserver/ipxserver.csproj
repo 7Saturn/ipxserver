@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ipxserver</AssemblyName>
+    <RootNamespace>IpxServer</RootNamespace>
+    <Description>Standalone DOSBox IPX server (IPX over UDP tunnel, IPv4 and IPv6)</Description>
+    <Copyright>Copyright (C) 2010 Alexander Clouter, GPL-2.0-or-later</Copyright>
+    <!-- Needed for the libc calls in Privileges.cs (LibraryImport). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Turns on the trimming/AOT analyzers during every normal build, so that
+         code which would break in the trimmed release binary is found early. -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <!-- Server GC is pointless for this workload; keep the footprint small. -->
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <!-- Release publishing ("dotnet publish -c Release -r <rid>"):
+       one self-contained executable per platform which neither needs an
+       installed .NET runtime nor any further files. These settings only take
+       effect when a runtime identifier (-r) is given, so plain
+       "dotnet build" / "dotnet run" stay fast and framework-dependent. -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != ''">
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Lets the test project access "internal" members. -->
+    <InternalsVisibleTo Include="ipxserver.Tests" />
+  </ItemGroup>
+
+</Project>

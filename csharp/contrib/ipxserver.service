@@ -1,0 +1,58 @@
+# systemd unit for ipxserver.
+#
+# Installation (as root), see also the README:
+#   install -m 755 ipxserver /usr/local/bin/ipxserver
+#   install -m 644 ipxserver.service /etc/systemd/system/ipxserver.service
+#   systemctl daemon-reload
+#   systemctl enable --now ipxserver
+#
+# The service never runs as root. systemd starts it as an unprivileged user
+# and grants it exactly one privilege: binding to ports below 1024.
+
+[Unit]
+Description=IPX server for DOSBox (IPX over UDP tunnel)
+Documentation=https://github.com/7Saturn/ipxserver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Add options as needed, e.g. "--port=213 --port6=2130 --idle=3600".
+# Without -n the messages go to syslog, which under systemd is the journal:
+#   journalctl -u ipxserver
+ExecStart=/usr/local/bin/ipxserver --logfile=/var/log/ipxserver/ipxserver.log
+Restart=on-failure
+RestartSec=5
+
+# Run as a throw-away system user, which systemd creates on the fly. To use a
+# fixed account instead, replace this line by "User=ipxserver" (and create
+# that user: useradd --system --no-create-home --shell /usr/sbin/nologin ipxserver).
+DynamicUser=yes
+# Creates /var/log/ipxserver, writable for the service user.
+LogsDirectory=ipxserver
+
+# The trick for port 213: allow binding to privileged ports, nothing else.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# Lock the service away from the rest of the system.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+# Do NOT add MemoryDenyWriteExecute=yes: the .NET runtime compiles code at
+# run time (JIT) and needs writable and executable memory for that.
+
+# The .NET diagnostic interfaces (debugger, profiler) are not needed in
+# production.
+Environment=DOTNET_EnableDiagnostics=0
+
+[Install]
+WantedBy=multi-user.target

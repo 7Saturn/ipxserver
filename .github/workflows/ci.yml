@@ -1,0 +1,38 @@
+# Builds the C# port and runs its tests on Linux and Windows for every push
+# and pull request which touches it.
+name: CI
+
+on:
+  push:
+    branches: [master]
+    paths: ["csharp/**", ".github/workflows/**"]
+  pull_request:
+    paths: ["csharp/**", ".github/workflows/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: csharp
+    steps:
+      - uses: actions/checkout@v6
+
+      # Installs the .NET SDK in the version demanded by csharp/global.json.
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: csharp/global.json
+
+      - name: Build
+        run: dotnet build ipxserver.slnx -c Release
+
+      - name: Test
+        run: dotnet run --project tests/ipxserver.Tests -c Release --no-build

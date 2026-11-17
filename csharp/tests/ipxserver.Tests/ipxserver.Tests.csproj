@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The tests are a plain console program without any NuGet dependency
+       (no xUnit/NUnit). So they build and run everywhere the server builds,
+       even offline, with "dotnet run" on this project.
+       The exit code is 0 if all tests passed, 1 otherwise. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ipxserver.Tests</AssemblyName>
+    <RootNamespace>IpxServer.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/ipxserver/ipxserver.csproj" />
+  </ItemGroup>
+
+</Project>

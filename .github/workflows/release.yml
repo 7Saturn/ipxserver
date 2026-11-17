@@ -1,0 +1,99 @@
+# Builds the release binaries for all platforms and publishes them as a
+# GitHub release.
+#
+# How to make a release: push a tag which starts with "v" and is followed by
+# the version number, e.g.
+#
+#   git tag v2.0.0
+#   git push origin v2.0.0
+#
+# The workflow then
+#   1. runs the tests on Linux and Windows,
+#   2. builds the self-contained binaries for all platforms (on one Linux
+#      machine, .NET can build for the other platforms from there),
+#   3. creates the release "v2.0.0" with one archive per platform attached.
+#
+# It can also be started by hand (Actions > Release > Run workflow). Then
+# steps 1 and 2 are done and the archives can be downloaded as "artifacts" of
+# the workflow run, but no release is created.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number to compile in, e.g. 2.0.0"
+        required: false
+        default: "0.0.0"
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: csharp
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: csharp/global.json
+      - name: Test
+        run: dotnet run --project tests/ipxserver.Tests -c Release
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to create the release and to upload files to it.
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      # Installs the .NET SDK in the version demanded by csharp/global.json.
+      # Everything else the build needs (the .NET runtimes for the target
+      # platforms) is downloaded by "dotnet publish" itself from nuget.org.
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: csharp/global.json
+
+      - name: Determine version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            # Tag v2.0.0 -> version 2.0.0
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${INPUT_VERSION:-0.0.0}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and package
+        run: ./csharp/build.sh --skip-tests --package --version "${{ steps.version.outputs.version }}"
+
+      # Keeps the archives with the workflow run, also for manual runs.
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ipxserver-${{ steps.version.outputs.version }}
+          path: |
+            csharp/dist/*.zip
+            csharp/dist/*.tar.gz
+            csharp/dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "ipxserver ${{ steps.version.outputs.version }}" \
+            --generate-notes \
+            csharp/dist/*.zip csharp/dist/*.tar.gz csharp/dist/SHA256SUMS.txt
